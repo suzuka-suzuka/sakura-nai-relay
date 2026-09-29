@@ -1,0 +1,10 @@
+.git
+.data
+.preview
+.env
+node_modules
+tests
+scripts
+docs
+*.log
+.qa-archive

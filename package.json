@@ -1,0 +1,14 @@
+{
+  "name": "sakura-nai-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sakura NAI 中转与密钥控制台",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/index.mjs",
+    "dev": "node --env-file-if-exists=.env --watch src/index.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}
