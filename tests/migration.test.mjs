@@ -36,6 +36,36 @@ test('删除账号权重保留密钥、绑定和流水，原权重零转为停�
   }
 });
 
+test('增加密钥删除标记保留现有密钥与流水，删除后重启不会恢复凭据或绑定', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'sakura-schema-test-')); let store;
+  try {
+    store = new Store(directory); store.setUpstream('pst-migration-test');
+    const active = store.createKey('保留密钥', 100);
+    const member = store.createKey('待删除会员', 88, { tier: 'member', upstreamId: 1, validDays: 30 });
+    store.reserve(member.id, 'delete-history', '/ai/generate-image', 'nai-diffusion-5-full', 26, null, 1);
+    store.settle('delete-history', 26, 'completed', '保留历史', 200);
+    const expires = store.key(member.id).expires_at, ledger = store.ledger();
+    store.db.exec('ALTER TABLE keys DROP COLUMN retired_at');
+    store.close(); store = new Store(directory);
+    assert.deepEqual(store.revealKey(active.id), active); assert.deepEqual(store.revealKey(member.id), member);
+    assert.equal(store.key(member.id).expires_at, expires); assert.equal(store.key(member.id).balance, 62);
+    assert.equal(store.upstreams()[0].bound_keys, 1); assert.deepEqual(store.ledger(), ledger);
+    store.retireKey(member.id); store.retireUpstream(1);
+    store.close(); store = new Store(directory);
+    assert.equal(store.authenticate(member.token), null); assert.equal(store.key(member.id), undefined);
+    assert.throws(() => store.updateKey(member.id, { enabled: true }), /密钥不存在/);
+    assert.throws(() => store.revealKey(member.id), /密钥不存在/);
+    assert.deepEqual(store.keys().map(key => key.id), [active.id]);
+    assert.equal(store.authenticate(active.token).balance, 100); assert.equal(store.upstreams().length, 0);
+    assert.equal(store.jobs()[0].charged, 26); assert.equal(store.jobs()[0].key_name, '待删除会员');
+    assert.deepEqual(store.ledger(), ledger); assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally {
+    store?.close();
+    assert.ok(resolve(directory).startsWith(resolve(tmpdir()) + '\\sakura-schema-test-') || resolve(directory).startsWith(resolve(tmpdir()) + '/sakura-schema-test-'));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('升级使旧 Key 失效并归档旧流水，保留管理员和上游，重启不清理新 Key', () => {
   const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-')), master=Buffer.alloc(32,1);
   const token='skr_'+'a'.repeat(43);let db,store;

@@ -170,7 +170,7 @@ function keyTable(keys) {
     '<td><span class="badge '+(k.enabled && !expired(k) ? 'green' : 'muted')+'"><i></i>'+keyStatus(k)+'</span><small class="cell-note">'+e(expiresText(k.expires_at))+'</small></td>'+
     '<td><span class="point-value">'+number(k.balance-k.reserved)+'</span><small class="cell-note">'+(k.reserved ? '预留 '+number(k.reserved)+' Anlas' : 'Anlas')+'</small></td>'+
     '<td>'+e(k.tier === 'member' ? k.upstream_name : '账号池')+'<small class="cell-note">'+(k.tier === 'member' ? '共享体力 · 耗尽后按点数' : 'NAI5 体力 0%')+'</small></td>'+
-    '<td class="right"><button class="button small subtle" data-action="points" data-id="'+k.id+'">调整点数</button><button class="button small subtle" data-action="edit-key" data-id="'+k.id+'">编辑</button><button class="button small subtle" data-action="key-detail" data-id="'+k.id+'">查看密钥</button></td></tr>'
+    '<td class="right"><button class="button small subtle" data-action="points" data-id="'+k.id+'">调整点数</button><button class="button small subtle" data-action="edit-key" data-id="'+k.id+'">编辑</button><button class="button small subtle" data-action="key-detail" data-id="'+k.id+'">查看密钥</button><button class="button small danger" data-action="remove-key" data-id="'+k.id+'">删除</button></td></tr>'
   ).join('')+'</tbody></table></div>';
 }
 function keysView() { return `<div class="panel"><div class="panel-title"><div><h2>全部密钥 <span class="count">${state.data.keys.length}</span></h2></div><label class="search">${icon('search')}<input id="key-search" type="search" placeholder="搜索名称或密钥" value="${e(state.filter)}" aria-label="搜索密钥"></label></div><div id="key-table">${keyTable(filteredKeys())}</div></div>`; }
@@ -209,7 +209,12 @@ async function detail(id) {
     '<dt>状态</dt><dd>'+keyStatus(k)+'</dd></dl><div class="modal-actions key-actions">'+
     '<button class="button subtle" data-action="edit-key" data-id="'+k.id+'">编辑 / 续期</button>'+
     '<button class="button '+(k.enabled ? 'danger' : 'subtle')+'" data-action="toggle-key" data-id="'+k.id+'">'+(k.enabled ? '停用密钥' : '启用密钥')+'</button>'+
+    '<button class="button danger" data-action="remove-key" data-id="'+k.id+'">删除密钥</button>'+
     '<button class="button primary" data-action="copy-key">'+icon('copy')+'复制密钥</button></div>');
+}
+function removeKey(id) {
+  const key = state.data.keys.find(k => k.id === Number(id)); if (!key) return;
+  modal('删除访问密钥', `<p class="muted">确认删除「${e(key.name)}」？</p><code class="token-display">${e(key.prefix)}</code><p class="muted">删除后密钥立即失效并从列表移除，剩余 ${number(key.balance)} Anlas 不再可用。已有请求记录和 Anlas 流水会保留，此操作无法撤销。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-key" data-id="${key.id}">确认删除</button></div>`);
 }
 function jobDetail(id) {
   const j = state.data.jobs.find(j => j.id === id); if (!j) return;
@@ -229,6 +234,7 @@ document.addEventListener('click', async event => {
   if (action === 'close') return closeModal();
   if (action === 'create') return createKey();
   if (action === 'edit-key') return keyForm(id);
+  if (action === 'remove-key') return removeKey(id);
   if (action === 'add-upstream' || action === 'edit-upstream') return editUpstream(id);
   if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
   if (action === 'points') return points(id);
@@ -241,6 +247,7 @@ document.addEventListener('click', async event => {
     if (action === 'quota') await quota();
     if (action === 'toggle-upstream') { const row = state.data.upstreams.find(u => u.id === Number(id)); await api('/upstreams/'+id, { method:'PUT', body:{ name:row.name, enabled:!row.enabled } }); await refresh(); toast(row.enabled ? '上游已停用' : '上游已启用'); }
     if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
+    if (action === 'confirm-remove-key') { await api('/keys/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('密钥已删除，历史记录已保留'); }
     if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
     if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }
     if (action === 'toggle-key') { const key = state.data.keys.find(k => k.id === Number(id)); await api(`/keys/${id}`, { method: 'POST', body: { enabled: !key.enabled } }); closeModal(); await refresh(); toast(key.enabled ? '密钥已停用' : '密钥已启用'); }

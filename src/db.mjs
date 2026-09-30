@@ -31,7 +31,7 @@ export class Store {
         balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0), reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved >= 0),
         token_encrypted TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('standard','member')),
         nai5_upstream_id INTEGER REFERENCES upstreams(id), expires_at INTEGER,
-        enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_used_at INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_used_at INTEGER, retired_at INTEGER,
         CHECK((tier='member' AND nai5_upstream_id IS NOT NULL) OR (tier='standard' AND nai5_upstream_id IS NULL)));
       CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (
@@ -60,6 +60,8 @@ export class Store {
       this.db.exec('ALTER TABLE jobs ADD COLUMN upstream_spent INTEGER NOT NULL DEFAULT 0');
       this.db.exec("UPDATE jobs SET upstream_spent=upstream_estimate WHERE status='completed' OR (status='resolved' AND charged>0)");
     });
+    if (!this.db.prepare('PRAGMA table_info(keys)').all().some(c => c.name === 'retired_at'))
+      this.db.exec('ALTER TABLE keys ADD COLUMN retired_at INTEGER');
     this.db.exec('CREATE INDEX IF NOT EXISTS jobs_upstream_state ON jobs(upstream_id,status)');
     this.db.exec('CREATE INDEX IF NOT EXISTS keys_binding ON keys(nai5_upstream_id)');
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
@@ -77,7 +79,7 @@ export class Store {
   transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (error) { this.db.exec('ROLLBACK'); throw error; } }
   upstreams() {
     return this.db.prepare(`SELECT u.id,u.name,u.suffix,u.enabled,u.created_at,
-      (SELECT COUNT(*) FROM keys WHERE nai5_upstream_id=u.id) AS bound_keys
+      (SELECT COUNT(*) FROM keys WHERE nai5_upstream_id=u.id AND retired_at IS NULL) AS bound_keys
       FROM upstreams u WHERE retired_at IS NULL ORDER BY id`).all();
   }
   upstream(id) { return this.db.prepare('SELECT * FROM upstreams WHERE id=? AND retired_at IS NULL').get(id); }
@@ -101,7 +103,7 @@ export class Store {
     this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name, Number(enabled), id);
   }
   retireUpstream(id) {
-    assert(!this.db.prepare('SELECT id FROM keys WHERE nai5_upstream_id=? LIMIT 1').get(id), '该上游仍绑定会员密钥，请先改绑或调整等级', 409);
+    assert(!this.db.prepare('SELECT id FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL LIMIT 1').get(id), '该上游仍绑定会员密钥，请先改绑或调整等级', 409);
     this.db.prepare('UPDATE upstreams SET enabled=0,retired_at=? WHERE id=?').run(Date.now(), id);
   }
   hasUnsettled(id) { return !!this.db.prepare("SELECT id FROM jobs WHERE upstream_id=? AND status='running' LIMIT 1").get(id); }
@@ -112,15 +114,15 @@ export class Store {
     return this.addUpstream({ name: 'NovelAI 官方', token });
   }
   keys() { return this.db.prepare(`SELECT k.id,k.name,k.prefix,k.balance,k.reserved,k.enabled,k.created_at,k.last_used_at,
-    k.tier,k.nai5_upstream_id,k.expires_at,u.name AS upstream_name FROM keys k LEFT JOIN upstreams u ON u.id=k.nai5_upstream_id ORDER BY k.id DESC`).all(); }
-  key(id) { return this.db.prepare('SELECT * FROM keys WHERE id=?').get(id); }
+    k.tier,k.nai5_upstream_id,k.expires_at,u.name AS upstream_name FROM keys k LEFT JOIN upstreams u ON u.id=k.nai5_upstream_id WHERE k.retired_at IS NULL ORDER BY k.id DESC`).all(); }
+  key(id) { return this.db.prepare('SELECT * FROM keys WHERE id=? AND retired_at IS NULL').get(id); }
   usableKey(id) {
     const key = this.key(id); assert(key?.enabled, '中转密钥无效或已停用', 401);
     if (key.expires_at !== null && key.expires_at <= Date.now()) throw new HttpError(403, '访问密钥已过期，请联系管理员续期', 'KEY_EXPIRED');
     return key;
   }
   authenticate(token) {
-    const key = this.db.prepare('SELECT id FROM keys WHERE token_hash=?').get(hash(token));
+    const key = this.db.prepare('SELECT id FROM keys WHERE token_hash=? AND retired_at IS NULL').get(hash(token));
     return key ? this.usableKey(key.id) : null;
   }
   revealKey(id) {
@@ -158,6 +160,15 @@ export class Store {
       assert(options.enabled === undefined || typeof options.enabled === 'boolean', '状态无效');
       this.db.prepare('UPDATE keys SET name=?,tier=?,nai5_upstream_id=?,expires_at=?,enabled=? WHERE id=?')
         .run(options.name ?? key.name, tier, binding, expires, options.enabled === undefined ? key.enabled : Number(options.enabled), id);
+    });
+  }
+  retireKey(id) {
+    this.transaction(() => {
+      const key = this.key(id); assert(key, '密钥不存在', 404);
+      assert(key.reserved === 0 && !this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1").get(id),
+        '请等待该密钥的生成和排队结束，再删除密钥', 409);
+      // Keep the row for historical job and ledger references; erase the recoverable credential.
+      this.db.prepare("UPDATE keys SET enabled=0,retired_at=?,token_encrypted='' WHERE id=?").run(Date.now(), id);
     });
   }
   adjust(id, delta, note) {

@@ -173,6 +173,13 @@ export function createApp(config) {
       return json(res, 200, store.revealKey(Number(secretMatch[1])));
     }
     const keyMatch = /^\/admin\/api\/keys\/(\d+)(\/points)?$/.exec(path);
+    if (keyMatch && !keyMatch[2] && req.method === 'DELETE') {
+      await readBody(req, 4096);
+      const id = Number(keyMatch[1]); assert(store.key(id), '密钥不存在', 404);
+      assert(!router.keyQueue.size(id), '请等待该密钥的生成和排队结束，再删除密钥', 409);
+      store.retireKey(id);
+      return json(res, 200, { ok: true });
+    }
     if (keyMatch && req.method === 'POST') {
       const id = Number(keyMatch[1]), body = parse(await readBody(req, 4096));
       assert(store.key(id), '密钥不存在', 404);

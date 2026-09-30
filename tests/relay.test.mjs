@@ -87,6 +87,93 @@ test('完整密钥可重复查看，仅管理员通过 Origin 和 CSRF 校验后
 
 
 
+test('删除密钥仅管理员通过 Origin 和 CSRF 校验后可操作', async t => {
+  const f = await fixture(t), path = `/admin/api/keys/${f.key.id}`;
+  assert.equal((await fetch(f.base + path, { method: 'DELETE', headers: { Origin: origin } })).status, 401);
+  for (const headers of [{ 'X-CSRF-Token': '' }, { Origin: 'https://evil.example' }])
+    assert.equal((await f.call(path, 'DELETE', undefined, headers)).status, 403);
+  assert.equal((await f.call(path + '/points', 'DELETE')).status, 404);
+  assert.equal((await f.call('/admin/api/keys/99999', 'DELETE')).status, 404);
+  assert.ok(f.app.store.key(f.key.id));
+  assert.equal((await f.relay('/user/subscription')).status, 200);
+});
+
+test('删除密钥立即撤销凭据并保留请求、流水和用量统计，不能再次管理', async t => {
+  const f = await fixture(t), path = `/admin/api/keys/${f.key.id}`;
+  const other = await (await f.call('/admin/api/keys', 'POST', { name: '保留的密钥', points: 55 })).json();
+  assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  const before = await (await f.call('/admin/api/snapshot')).json();
+  const response = await f.call(path, 'DELETE');
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ok: true });
+  const after = await (await f.call('/admin/api/snapshot')).json();
+  assert.deepEqual(after.keys.map(key => key.id), [other.id]);
+  for (const field of ['jobs', 'ledger', 'stats', 'trend']) assert.deepEqual(after[field], before[field]);
+  assert.equal(after.jobs[0].key_name, '测试用户');
+  assert.equal(f.app.store.key(f.key.id), undefined); assert.equal(f.app.store.authenticate(f.key.token), null);
+  const retired = f.app.store.db.prepare('SELECT * FROM keys WHERE id=?').get(f.key.id);
+  assert.equal(retired.enabled, 0); assert.ok(retired.retired_at); assert.equal(retired.token_encrypted, '');
+  assert.equal(retired.balance, 74); assert.equal(retired.reserved, 0);
+  assert.equal((await f.relay('/user/subscription')).status, 401);
+  assert.equal((await f.relay('/ai/generate-image', payload())).status, 401);
+  for (const [endpoint, method, body] of [
+    [path, 'DELETE'], [path, 'POST', { enabled: true }], [path, 'POST', { validDays: 30 }],
+    [path + '/reveal', 'POST', {}], [path + '/points', 'POST', { delta: 1, note: '不可充值' }],
+  ]) assert.equal((await f.call(endpoint, method, body)).status, 404);
+  assert.equal(generatedCalls(f).length, 1);
+  assert.deepEqual(f.app.store.db.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('删除会员密钥解除上游绑定占用，并允许移除上游而保留历史', async t => {
+  const f = await fixture(t); await member(f); f.mock.state.paid = false;
+  assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.equal(f.app.store.upstreams()[0].bound_keys, 1);
+  assert.equal((await f.call(`/admin/api/keys/${f.key.id}`, 'DELETE')).status, 200);
+  assert.equal(f.app.store.upstreams()[0].bound_keys, 0);
+  assert.equal((await f.call('/admin/api/upstreams/1', 'DELETE')).status, 200);
+  const snapshot = await (await f.call('/admin/api/snapshot')).json();
+  assert.equal(snapshot.keys.length, 0); assert.equal(snapshot.upstreams.length, 0);
+  assert.equal(snapshot.jobs[0].key_name, '测试用户'); assert.equal(snapshot.jobs[0].upstream_name, 'Mock');
+  assert.equal(snapshot.ledger.filter(row => row.kind === 'usage').length, 1);
+  assert.deepEqual(f.app.store.db.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('生成及排队期间拒绝删除，全部请求结算后才允许删除', async t => {
+  const f = await fixture(t); f.mock.state.slow = 160;
+  const path = `/admin/api/keys/${f.key.id}`;
+  const first = f.relay('/ai/generate-image', payload()); await waitFor(() => generatedCalls(f).length === 1);
+  const second = f.relay('/ai/generate-image', payload()); await waitFor(() => f.app.router.keyQueue.size(f.key.id) === 2);
+  const rejected = await f.call(path, 'DELETE');
+  assert.equal(rejected.status, 409); assert.match((await rejected.json()).error, /生成和排队结束/);
+  assert.ok(f.app.store.key(f.key.id));
+  assert.deepEqual((await Promise.all([first, second])).map(response => response.status), [200, 200]);
+  await waitFor(() => f.app.router.keyQueue.size(f.key.id) === 0);
+  assert.equal(f.app.store.key(f.key.id).balance, 48); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  assert.equal((await f.call(path, 'DELETE')).status, 200);
+  assert.equal(f.app.store.jobs().length, 2);
+});
+
+test('尚未预留的排队请求和零点数进行中任务也会阻止删除', async t => {
+  const f = await fixture(t), path = `/admin/api/keys/${f.key.id}`;
+  const unlock = await f.app.router.lockKey(f.key.id);
+  try { assert.equal((await f.call(path, 'DELETE')).status, 409); }
+  finally { unlock(); }
+  f.app.store.reserve(f.key.id, 'zero-running', '/ai/generate-image', 'nai-diffusion-5-full', 0, null, 1);
+  assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  assert.equal((await f.call(path, 'DELETE')).status, 409);
+  assert.throws(() => f.app.store.retireKey(f.key.id), /生成和排队结束/);
+  f.app.store.fail('zero-running', '测试任务已结束');
+  assert.equal((await f.call(path, 'DELETE')).status, 200);
+  assert.equal(f.app.store.jobs()[0].charged, 0);
+});
+
+test('停用和过期密钥都可以删除', async t => {
+  const f = await fixture(t);
+  const expired = await (await f.call('/admin/api/keys', 'POST', { name: '过期密钥', points: 1, expiresAt: Date.now() - 1 })).json();
+  await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { enabled: false });
+  for (const key of [f.key, expired]) assert.equal((await f.call(`/admin/api/keys/${key.id}`, 'DELETE')).status, 200);
+  assert.equal(f.app.store.keys().length, 0);
+});
+
 test('生成按本地公式扣除 Anlas、持久化流水，并兼容现有请求', async t => {
   const f = await fixture(t);
   const res = await f.relay('/ai/generate-image',payload()); assert.equal(res.status,200); assert.equal((await res.json()).images.length,1);
