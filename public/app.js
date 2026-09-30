@@ -40,7 +40,35 @@ async function withButton(button, fn) {
   try { await fn(); } catch (err) { toast(err.message, true); }
   finally { if (button) { button.disabled = false; button.classList.remove('working'); } }
 }
-async function copy(text) { await navigator.clipboard.writeText(text); toast('已复制到剪贴板'); }
+function copyWithSelection(text) {
+  const field = document.createElement('textarea');
+  field.value = text; field.readOnly = true;
+  field.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px';
+  const focused = document.activeElement, selection = document.getSelection();
+  const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : [];
+  // A modal dialog makes the rest of the document inert, so keep the field inside it.
+  const dialog = $('#dialog'); (dialog?.open ? dialog : document.body).append(field);
+  try {
+    field.focus({ preventScroll: true }); field.select(); field.setSelectionRange(0, field.value.length);
+    return document.execCommand('copy');
+  } finally {
+    field.remove(); focused?.focus({ preventScroll: true });
+    if (selection) { selection.removeAllRanges(); for (const range of ranges) selection.addRange(range); }
+  }
+}
+async function copy(text, source) {
+  if (typeof navigator.clipboard?.writeText === 'function') {
+    try { await navigator.clipboard.writeText(text); toast('已复制到剪贴板'); return; }
+    catch { /* Try selection-based copying if clipboard access is denied. */ }
+  }
+  try { if (copyWithSelection(text)) { toast('已复制到剪贴板'); return; } }
+  catch { /* Keep the visible text available for manual copying. */ }
+  if (source) {
+    const selection = document.getSelection(), range = document.createRange();
+    range.selectNodeContents(source); selection?.removeAllRanges(); selection?.addRange(range);
+  }
+  throw new Error('浏览器未允许自动复制，已选中文本，请按 Ctrl+C / ⌘C 或长按复制');
+}
 function modal(title, content, subtitle = '') {
   const dialog = $('#dialog');
   dialog.innerHTML = `<div class="modal-head"><div><h2 id="dialog-title">${e(title)}</h2>${subtitle ? `<p class="muted">${e(subtitle)}</p>` : ''}</div><button class="icon-button" data-action="close" aria-label="关闭">${icon('close')}</button></div>${content}`;
@@ -213,8 +241,8 @@ document.addEventListener('click', async event => {
     if (action === 'quota') await quota();
     if (action === 'toggle-upstream') { const row = state.data.upstreams.find(u => u.id === Number(id)); await api('/upstreams/'+id, { method:'PUT', body:{ name:row.name, enabled:!row.enabled } }); await refresh(); toast(row.enabled ? '上游已停用' : '上游已启用'); }
     if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
-    if (action === 'copy-url') await copy(state.data.relayUrl);
-    if (action === 'copy-key') await copy($('#new-token').textContent);
+    if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
+    if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }
     if (action === 'toggle-key') { const key = state.data.keys.find(k => k.id === Number(id)); await api(`/keys/${id}`, { method: 'POST', body: { enabled: !key.enabled } }); closeModal(); await refresh(); toast(key.enabled ? '密钥已停用' : '密钥已启用'); }
     if (action === 'logout') { await api('/logout', { method: 'POST', body: {} }); state.data = null; state.csrf = null; state.quota = null; await init(); }
   });
