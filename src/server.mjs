@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { Store } from './db.mjs';
 import { HttpError, assert, integer, hash, random, equal, passwordHash, verifyPassword } from './security.mjs';
-import { balanceOf, publicSubscription, reservation, StreamCheck } from './billing.mjs';
+import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount, isActiveOpus, hasNai5Allowance, isNai5Generation, reservation, StreamCheck } from './billing.mjs';
 import { upstreamClient, readBounded } from './upstream.mjs';
 import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
@@ -49,6 +49,25 @@ export function createApp(config) {
     res.setHeader('Set-Cookie', `sakura_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${config.cookieSecure ? '; Secure' : ''}`);
     return csrf;
   }
+  async function autoBindMember() {
+    const rows = router.available().filter(row => !editingUpstreams.has(row.id));
+    const candidates = []; let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
+      while (cursor < rows.length) {
+        const row = rows[cursor++], tokenHash = store.upstream(row.id)?.token_hash;
+        try {
+          const data = await upstream.subscription(store.upstreamToken(row.id));
+          if (isActiveOpus(data) && Number.isFinite(data.usage?.percent) && typeof data.usage?.isNegative === 'boolean')
+            candidates.push({ id: row.id, percent: hasNai5Allowance(data) ? Math.max(0, Math.min(100, data.usage.percent)) : 0, tokenHash });
+        } catch { /* Failed queries are not eligible for automatic binding. */ }
+      }
+    }));
+    const available = new Set(router.available().filter(row => !editingUpstreams.has(row.id)).map(row => row.id));
+    const selected = candidates.filter(row => available.has(row.id) && store.upstream(row.id)?.token_hash === row.tokenHash)
+      .sort((a, b) => b.percent - a.percent || a.id - b.id)[0];
+    assert(selected, '没有可绑定的有效 Opus 上游，请检查账户状态或额度查询', 503);
+    return selected.id;
+  }
   async function admin(req, res, path) {
     if (req.method !== 'GET') assert(req.headers.origin === config.publicOrigin, '请求来源不匹配，请检查 PUBLIC_ORIGIN', 403);
     if (path === '/admin/api/status' && req.method === 'GET') {
@@ -76,9 +95,8 @@ export function createApp(config) {
       return json(res, 200, { ok: true });
     }
     if (path === '/admin/api/snapshot' && req.method === 'GET') {
-      const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent,
-        SUM(CASE WHEN status='review' THEN 1 ELSE 0 END) AS reviews FROM jobs`).get();
-      const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
+      const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
+      const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
       return json(res, 200, { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys(), jobs: store.jobs(), ledger: store.ledger(), stats, trend, busy: router.busy.size > 0, relayUrl: config.publicOrigin });
     }
     if (path === '/admin/api/quota' && req.method === 'GET') {
@@ -89,8 +107,8 @@ export function createApp(config) {
           const index = cursor++, row = rows[index];
           try {
             const data = await upstream.subscription(store.upstreamToken(row.id));
-            results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, weight: row.weight, ok: true, account: publicSubscription(data, { balance: balanceOf(data), reserved: 0 }) };
-          } catch { results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, weight: row.weight, ok: false, error: '额度查询失败，请检查 Key 或稍后重试' }; }
+            results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: true, account: upstreamSubscription(data) };
+          } catch { results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: false, error: '额度查询失败，请检查 Key 或稍后重试' }; }
         }
       }));
       return json(res, 200, { upstreams: results, totalAnlas: results.reduce((sum, r) => sum + (r.ok ? r.account.relay.balance : 0), 0), failed: results.filter(r => !r.ok).length, fetchedAt: Date.now() });
@@ -105,24 +123,24 @@ export function createApp(config) {
       if (id !== null) editingUpstreams.add(id);
       try {
         if (req.method === 'DELETE') {
-          assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中或待核对的请求，暂不能移除', 409);
+          assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
           store.retireUpstream(id); router.reset(id);
           return json(res, 200, { ok: true });
         }
         const body = parse(await readBody(req, 16384));
-        const name = label(body.name), weight = integer(body.weight, 0, 1000, '权重');
+        const name = label(body.name);
         assert(typeof body.enabled === 'boolean', '状态无效');
         const token = typeof body.token === 'string' ? body.token.trim() : '';
         assert(id !== null || token, '请填写官方 Key');
         if (token) {
           assert(token.length <= 4096 && /^pst-\S+$/.test(token), '请输入有效的 NovelAI Persistent Token');
-          assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '请等待该上游请求结束并完成核对，再更换 Key', 409);
+          assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '请等待该上游请求结束，再更换 Key', 409);
           await upstream.subscription(token);
           assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '该上游有请求正在执行，请稍后更换 Key', 409);
         }
         const savedId = store.transaction(() => {
-          if (id === null) return store.addUpstream({ name, token, weight, enabled: body.enabled });
-          store.updateUpstream(id, { name, token, weight, enabled: body.enabled }); return id;
+          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled });
+          store.updateUpstream(id, { name, token, enabled: body.enabled }); return id;
         });
         if (token) router.reset(savedId);
         return json(res, id === null ? 201 : 200, { id: savedId });
@@ -145,30 +163,26 @@ export function createApp(config) {
     }
     if (path === '/admin/api/keys' && req.method === 'POST') {
       const body = parse(await readBody(req, 4096));
-      return json(res, 201, store.createKey(label(body.name), integer(body.points, 0, 1_000_000_000)));
+      const name = label(body.name), points = integer(body.points, 0, 1_000_000_000);
+      if (body.tier === 'member') body.upstreamId = await autoBindMember();
+      return json(res, 201, store.createKey(name, points, body));
     }
-    const secretMatch = /^\/admin\/api\/keys\/(\d+)\/(reveal|regenerate)$/.exec(path);
+    const secretMatch = /^\/admin\/api\/keys\/(\d+)\/reveal$/.exec(path);
     if (secretMatch && req.method === 'POST') {
-      const id = Number(secretMatch[1]), body = parse(await readBody(req, 4096));
-      if (secretMatch[2] === 'reveal') return json(res, 200, store.revealKey(id));
-      assert(body.confirm === true, '请确认重新生成后旧密钥会失效');
-      assert(!router.activeKeys.has(id), '请求进行中，请完成后再重新生成', 409);
-      return json(res, 200, store.regenerateKey(id));
+      await readBody(req, 4096);
+      return json(res, 200, store.revealKey(Number(secretMatch[1])));
     }
     const keyMatch = /^\/admin\/api\/keys\/(\d+)(\/points)?$/.exec(path);
     if (keyMatch && req.method === 'POST') {
       const id = Number(keyMatch[1]), body = parse(await readBody(req, 4096));
       assert(store.key(id), '密钥不存在', 404);
       if (keyMatch[2]) store.adjust(id, integer(body.delta, -1_000_000_000, 1_000_000_000), label(body.note, 160));
-      else { assert(typeof body.enabled === 'boolean', '状态无效'); store.db.prepare('UPDATE keys SET enabled=? WHERE id=?').run(Number(body.enabled), id); }
-      return json(res, 200, { ok: true });
-    }
-    const jobMatch = /^\/admin\/api\/jobs\/([A-Za-z0-9_-]+)\/resolve$/.exec(path);
-    if (jobMatch && req.method === 'POST') {
-      const body = parse(await readBody(req, 4096));
-      const job = store.db.prepare("SELECT id FROM jobs WHERE id=? AND status='review'").get(jobMatch[1]);
-      assert(job, '没有待核对任务', 409);
-      store.settle(job.id, integer(body.charged, 0, 1_000_000_000), 'resolved', `人工核对：${label(body.note, 160)}`);
+      else {
+        if (body.name !== undefined) body.name = label(body.name);
+        if (body.tier !== undefined || body.upstreamId !== undefined)
+          assert(!router.keyQueue.size(id), '请等待该密钥的生成和排队结束，再修改等级或绑定', 409);
+        store.updateKey(id, body);
+      }
       return json(res, 200, { ok: true });
     }
     if (path === '/admin/api/password' && req.method === 'POST') {
@@ -182,11 +196,103 @@ export function createApp(config) {
     throw new HttpError(404, '管理接口不存在');
   }
 
+  async function selectUpstream(path, body, keyId, signal) {
+    const key = store.usableKey(keyId);
+    let account = billingAccount(key), mode = key.tier === 'member' ? 'anlas-pool' : 'pool';
+    const requireAnlas = key.tier === 'member';
+    let exhaustedNai5 = false;
+    const inspect = async id => {
+      const unlock = await router.lockUpstream(id, signal);
+      try {
+        assert(!signal.aborted, '请求已取消', 499);
+        store.usableKey(keyId);
+        const row = router.assertAvailable(id);
+        assert(!editingUpstreams.has(id), '选定上游正在更新，请稍后重试', 503);
+        const token = store.upstreamToken(id);
+        let subscription;
+        try { subscription = await upstream.subscription(token); }
+        catch (error) { router.failed(id, '上游账户查询失败'); throw error; }
+        return { id, name: row.name, token, subscription, unlock };
+      } catch (error) { unlock(); throw error; }
+    };
+    // Only a free V5 request uses the binding. Paid requests retain the binding's local entitlement but use a pool.
+    if (key.tier === 'member' && isNai5Generation(path, body)) {
+      const selected = await inspect(key.nai5_upstream_id);
+      try {
+        account = billingAccount(key, selected.subscription);
+        exhaustedNai5 = !hasNai5Allowance(selected.subscription);
+        const amount = reservation(path, body, account);
+        if (!exhaustedNai5 && amount === 0)
+          return { ...selected, amount, upstreamEstimate: reservation(path, body, selected.subscription), mode: 'nai5-bound' };
+      } catch (error) { selected.unlock(); throw error; }
+      selected.unlock();
+      if (exhaustedNai5) mode = 'nai5-paid-pool';
+    }
+    const amount = reservation(path, body, account);
+    const current = store.usableKey(keyId);
+    assert(current.balance - current.reserved >= amount, `Anlas 不足，本次需要 ${amount} Anlas`, 402);
+    let lastError = null, pools = [null];
+    if (key.tier === 'member') {
+      // Read-only discovery does not occupy generation slots. Recheck under the selected account's lock below.
+      const rows = router.available(); let cursor = 0;
+      const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
+      const anlasPool = { scope: 'anlas', ids: new Set(), mode };
+      const preferFree = amount === 0 || exhaustedNai5;
+      pools = preferFree ? [freePool, anlasPool] : [anlasPool];
+      await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
+        while (cursor < rows.length && !signal.aborted) {
+          const row = rows[cursor++];
+          if (editingUpstreams.has(row.id)) continue;
+          try {
+            const subscription = await upstream.subscription(store.upstreamToken(row.id));
+            const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
+            if (preferFree && isActiveOpus(subscription) && estimate === 0) freePool.ids.add(row.id);
+            if (balance > 0 && balance >= estimate) anlasPool.ids.add(row.id);
+          } catch (error) { router.failed(row.id, '上游账户查询失败'); lastError = error; }
+        }
+      }));
+      assert(!signal.aborted, '请求已取消', 499);
+      store.usableKey(keyId);
+    }
+    for (const pool of pools) {
+      const excluded = new Set();
+      while (excluded.size < store.upstreams().length) {
+        let row;
+        try { row = router.pick(excluded, pool); } catch (error) { if (lastError) throw lastError; throw error; }
+        if (!row) break;
+        excluded.add(row.id);
+        let selected;
+        try { selected = await inspect(row.id); }
+        catch (error) {
+          if (signal.aborted || error.status === 401 || error.code === 'KEY_EXPIRED') throw error;
+          pool?.ids.delete(row.id);
+          lastError = error; continue;
+        }
+        try {
+          const upstreamEstimate = reservation(path, body, selected.subscription), balance = balanceOf(selected.subscription);
+          const funded = balance > 0 && balance >= upstreamEstimate;
+          const usable = pool?.scope === 'free' ? isActiveOpus(selected.subscription) && upstreamEstimate === 0
+            : requireAnlas ? funded : balance >= upstreamEstimate;
+          if (usable) return { ...selected, amount, upstreamEstimate, mode: pool?.mode ?? mode, pool };
+          // Free eligibility can disappear while queued; the refreshed account may still join the funded pool.
+          if (pool?.scope === 'free') {
+            const anlasPool = pools.find(p => p?.scope === 'anlas');
+            if (funded) anlasPool.ids.add(row.id); else anlasPool.ids.delete(row.id);
+          }
+        } catch (error) { selected.unlock(); throw error; }
+        pool?.ids.delete(row.id);
+        selected.unlock();
+      }
+    }
+    if (lastError) throw lastError;
+    throw new HttpError(503, '账号池没有余额足够的可用上游，请联系管理员补充 Anlas');
+  }
+
   async function paid(req, res, path, key) {
-    const selected = router.acquire(key.id);
-    let jobId = null, after = null, status = null;
+    const waiting = new AbortController();
+    const onClose = () => waiting.abort(); res.once('close', onClose);
+    let jobId = null, status = null, selected = null, unlockKey = null;
     try {
-      assert(!editingUpstreams.has(selected.id), '选定上游正在更新，请稍后重试', 429);
       const raw = await readBody(req, MAX_BODY), type = req.headers['content-type'] ?? '';
       let body, payload = raw;
       if (path === '/ai/upscale' && type.startsWith('multipart/form-data')) {
@@ -208,35 +314,36 @@ export function createApp(config) {
           assert(body.width === size.width && body.height === size.height, '声明尺寸与实际图片尺寸不符');
         }
       }
-      const token = selected.token;
-      let subscription;
-      try { subscription = await upstream.subscription(token); } catch (error) { router.failed(selected.id, '上游账户查询失败'); throw error; }
-      const before = balanceOf(subscription);
-      const amount = reservation(path, body, subscription);
+      // Drain uploads before queueing so the request-body timeout never includes queue wait.
+      unlockKey = await router.lockKey(key.id, waiting.signal);
+      // Validate the complete body before querying or occupying any upstream account.
+      reservation(path, body, billingAccount(store.usableKey(key.id)));
       const idempotency = req.headers['idempotency-key'] ?? null;
       assert(idempotency === null || typeof idempotency === 'string' && idempotency.length <= 128 && /^[\w-]+$/.test(idempotency), 'Idempotency-Key 格式无效');
+      if (idempotency) assert(!store.db.prepare('SELECT id FROM jobs WHERE key_id=? AND idempotency=?').get(key.id, idempotency), '该请求已受理，请勿重复提交', 409);
+      selected = await selectUpstream(path, body, key.id, waiting.signal);
+      assert(!waiting.signal.aborted, '请求已取消', 499);
+      assert(options().enabled, '中转已暂停', 503);
+      const { token, amount, upstreamEstimate, mode } = selected;
       const id = random().slice(0, 18);
-      store.reserve(key.id, id, path, body.model ?? body.req_type ?? 'image-tool', amount, before, idempotency, selected.id);
+      store.reserve(key.id, id, path, body.model ?? body.req_type ?? 'image-tool', amount, idempotency, selected.id, { mode, upstreamEstimate });
       jobId = id;
-      router.commit(selected.id);
+      res.setHeader('X-Request-Id', id);
+      if (mode !== 'nai5-bound') router.commit(selected.id, selected.pool);
       const streaming = path.endsWith('-stream');
       if (streaming) { body.parameters.stream = 'sse'; payload = Buffer.from(JSON.stringify(body)); }
       const response = await upstream.request(path, token, { method: 'POST', headers: { 'Content-Type': type, Accept: streaming ? 'text/event-stream' : req.headers.accept ?? 'application/zip, application/json' }, body: payload });
       status = response.status;
-      res.setHeader('X-Request-Id', id);
       if (!response.ok) {
         await readBounded(response, 1024 * 1024); // Never expose upstream error bodies or secrets.
         if (status === 429) {
-          store.settle(id, 0, 'rejected', '上游限流，未扣 Anlas', null, status);
+          store.fail(id, '上游限流，未扣 Anlas', status);
           router.failed(selected.id, '上游限流，稍后自动参与路由', 3);
           res.setHeader('Retry-After', '3');
           return json(res, 429, { error: '上游限流，请稍后重试', requestId: id });
         }
         if (status === 401 || status === 403) router.failed(selected.id, '上游鉴权失败，请检查 Key', 60);
-        try { after = balanceOf(await upstream.subscription(token)); } catch { /* Pending review. */ }
-        if ([400, 401, 402, 403, 404, 413, 415, 422, 429].includes(status) && after === before)
-          store.settle(id, 0, 'rejected', `上游拒绝请求（HTTP ${status}），未扣 Anlas`, after, status);
-        else store.review(id, `上游返回 HTTP ${status}，需核对是否扣费`, after, status);
+        store.fail(id, `上游返回 HTTP ${status}，任务失败，未扣 Anlas`, status);
         return json(res, status, { error: `上游拒绝请求（HTTP ${status}）`, requestId: id });
       }
       let complete = false, result = null;
@@ -249,7 +356,7 @@ export function createApp(config) {
         for await (const chunk of response.body) {
           size += chunk.length; assert(size <= 256 * 1024 * 1024, '生成结果过大', 502);
           check.feed(chunk);
-          // Continue draining upstream after a browser disconnect, so billing is still reconciled.
+          // A disconnected client cannot avoid the locally priced charge for a completed generation.
           if (!res.destroyed && !res.write(chunk)) await new Promise(resolve => {
             const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
             res.once('drain', done); res.once('close', done);
@@ -263,23 +370,20 @@ export function createApp(config) {
           try { const value = JSON.parse(result); complete = Array.isArray(value.images) && value.images.length === (body.parameters?.n_samples ?? (body.req_type === 'bg-removal' ? 3 : 1)) && value.images.every(i => i.image); } catch { complete = false; }
         } else if (path !== '/ai/encode-vibe') complete &&= contentType.startsWith('image/') || result.subarray(0, 2).toString() === 'PK';
       }
-      // Reconcile immediately. Only retry a missing/stale read; never delay a confirmed charge.
-      for (let i = 0; i < 3; i++) {
-        if (i) await new Promise(resolve => setTimeout(resolve, config.settlementDelay ?? 150));
-        try { after = balanceOf(await upstream.subscription(token)); } catch { after = null; }
-        if (after !== null && (after !== before || amount === 0)) break;
-      }
-      const delta = after === null ? null : before - after;
-      if (complete && delta !== null && delta >= 0 && delta <= amount && (delta > 0 || amount === 0)) store.settle(id, delta, 'completed', delta ? '按上游余额变化结算' : '上游免费生成，未扣 Anlas', after, status);
-      else store.review(id, !complete ? '响应未完整结束，需核对用量' : '上游扣费未确认或超出预留，请核对账单', after, status);
+      assert(complete, '上游未返回完整生成结果，任务失败，未扣点数', 502);
+      store.settle(id, amount, 'completed', amount ? '按密钥等级的本地报价结算' : '会员免费权益，未扣点数', status);
       if (!res.destroyed) {
         if (!streaming) { res.writeHead(status, { 'Content-Type': contentType }); res.end(result); }
         else res.end();
       }
     } catch (error) {
-      if (jobId) store.review(jobId, '请求中断或结果未知；不会自动重试，请核对上游账单', after, status);
+      if (jobId) store.fail(jobId, '请求超时、中断或结果不完整，任务失败，已释放预留点数', status);
+      if (res.headersSent && !res.destroyed && String(res.getHeader('Content-Type')).includes('text/event-stream')) {
+        res.end(`event: error\ndata: ${JSON.stringify({ event_type: 'error', error: '生成失败，未扣点数', requestId: jobId })}\n\n`);
+        return;
+      }
       throw error;
-    } finally { router.release(key.id, selected.id); }
+    } finally { selected?.unlock(); unlockKey?.(); res.off('close', onClose); }
   }
 
   const server = createServer(async (req, res) => {
@@ -304,20 +408,17 @@ export function createApp(config) {
         }
         if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
         assert(req.method === (PAID.has(path) ? 'POST' : 'GET'), '请求方法不支持', 405);
-        allow(`ip:${req.socket.remoteAddress}`, 300);
         const token = req.headers.authorization?.match(/^Bearer (skr_[A-Za-z0-9_-]{43})$/)?.[1];
         const key = token && store.authenticate(token); assert(key, '中转密钥无效或已停用', 401);
-        allow(`key:${key.id}`, 90);
         assert(options().enabled, '中转已暂停', 503);
         if (PAID.has(path)) return await paid(req, res, path, key);
-        const selected = router.query(key.id), upstreamToken = store.upstreamToken(selected.id);
         if (path === '/user/subscription') {
-          let data;
-          try { data = await upstream.subscription(upstreamToken); } catch (error) { router.failed(selected.id, '上游账户查询失败'); throw error; }
-          const result = publicSubscription(data, store.key(key.id));
-          result.relay.route = { upstreamId: selected.id, name: selected.name, leaseSeconds: 30 };
-          return json(res, 200, result);
+          const data = key.tier === 'member' ? await upstream.subscription(store.upstreamToken(key.nai5_upstream_id)) : null;
+          const current = store.usableKey(key.id);
+          assert(current.tier === key.tier && current.nai5_upstream_id === key.nai5_upstream_id, '密钥等级或绑定已变化，请重新查询订阅', 409);
+          return json(res, 200, downstreamSubscription(current, data));
         }
+        const selected = router.pick(), upstreamToken = store.upstreamToken(selected.id);
         assert(url.search.length < 4096, '标签查询过长');
         const response = await upstream.request(`${path}${url.search}`, upstreamToken, { headers: { Accept: 'application/json' } });
         assert(response.ok, `标签查询失败（HTTP ${response.status}）`, response.status);
@@ -332,9 +433,9 @@ export function createApp(config) {
       if (res.headersSent) { if (!res.destroyed) res.destroy(); return; }
       const status = error instanceof HttpError ? error.status : 502;
       if (status === 429) res.setHeader('Retry-After', '3');
-      json(res, status, { error: error instanceof HttpError ? error.message : '服务暂时不可用，请稍后重试或查看用量记录' });
+      json(res, status, { error: error instanceof HttpError ? error.message : '服务暂时不可用，请稍后重试或查看用量记录', ...(error.code ? { code: error.code } : {}) });
     }
   });
   server.requestTimeout = 30000; server.headersTimeout = 15000; server.maxHeadersCount = 50;
-  return { server, store, router, isBusy: () => router.busy.size > 0, close: async () => { await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); }); store.close(); } };
+  return { server, store, router, isBusy: () => router.busy.size > 0, close: async () => { router.close(); await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); }); store.close(); } };
 }

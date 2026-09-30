@@ -7,7 +7,7 @@ export function upscaleCost(width, height) {
   if (!Number.isFinite(area) || area <= 0 || area > 3145728) return null;
   return area <= 1048576 ? 1 : area <= 1747627 ? 2 : area <= 2446678 ? 3 : 4;
 }
-const active = account => !!account && ([1, 2, 3, 4].includes(account.accountType ?? 0) ||
+export const active = account => !!account && ([1, 2, 3, 4].includes(account.accountType ?? 0) ||
   (account.expiresAt !== undefined ? account.expiresAt > Date.now() / 1000 : account.active));
 export function augmentCost(width, height, backgroundRemoval, account) {
   const area = Math.max(1048576, Math.min(3145728, width * height));
@@ -16,7 +16,7 @@ export function augmentCost(width, height, backgroundRemoval, account) {
 }
 export function estimateCost(s, account, uncachedVibes = 0) {
   const v5 = isV5(s.model), opus = active(account) && account?.tier === 3;
-  const allowance = !v5 || !!(account?.usage && !account.usage.isNegative);
+  const allowance = !v5 || !!(account?.usage && Number.isFinite(account.usage.percent) && account.usage.percent > 0 && account.usage.isNegative === false);
   const area = s.width * s.height, free = opus && allowance && area <= 1048576 && s.steps <= 28;
   const smea = !s.imageSource && !v5 && !isV4(s.model) && s.autoSmea;
   const strength = s.imageSource ? s.imageSource.mode === 'infill' ? s.imageSource.inpaintStrength : s.imageSource.strength : 1;

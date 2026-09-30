@@ -1,60 +1,55 @@
 import { assert } from './security.mjs';
+import { SerialQueue } from './queue.mjs';
 
-/** Smooth weighted round-robin; reads never advance scheduling. */
+/** Prefer idle accounts, then shortest queues; round-robin ties within each pool. */
 export class UpstreamRouter {
   constructor(store) {
     this.store = store;
-    this.currents = new Map(); this.busy = new Set(); this.activeKeys = new Set();
-    this.leases = new Map(); this.cooldowns = new Map(); this.signature = '';
+    this.cursors = new Map();
+    this.busy = new Set(); this.activeKeys = new Set();
+    this.keyQueue = new SerialQueue(); this.upstreamQueue = new SerialQueue();
+    this.cooldowns = new Map();
   }
-  rows() {
-    const rows = this.store.upstreams(), signature = rows.map(r => `${r.id}:${r.weight}:${r.enabled}`).join('|');
-    if (signature !== this.signature) { this.currents.clear(); this.signature = signature; }
-    return rows;
-  }
+  rows() { return this.store.upstreams(); }
   status(row) {
     const cooling = this.cooldowns.get(row.id);
-    return { ...row, busy: this.busy.has(row.id), cooldownUntil: cooling?.until > Date.now() ? cooling.until : null,
+    return { ...row, busy: this.busy.has(row.id), queued: Math.max(0, this.upstreamQueue.size(row.id) - 1), cooldownUntil: cooling?.until > Date.now() ? cooling.until : null,
       error: cooling?.until > Date.now() ? cooling.error : null };
   }
-  available(includeBusy = false) {
-    assert(!this.store.hasOrphanReview(), '有旧请求待核对，请先完成结算', 409);
-    const enabled = this.rows().filter(r => r.enabled && r.weight > 0);
+  available() {
+    const enabled = this.rows().filter(r => r.enabled);
     assert(enabled.length, '没有启用的上游，请在后台添加或启用 Key', 503);
-    const healthy = enabled.filter(r => !r.reviews && !(this.cooldowns.get(r.id)?.until > Date.now()));
-    assert(healthy.length, '可用上游均待核对或冷却中，请稍后重试', enabled.some(r => r.reviews) ? 409 : 503);
-    const ready = healthy.filter(r => includeBusy || !this.busy.has(r.id));
-    assert(ready.length, '上游正在生成，请稍后重试', 429);
-    return ready;
+    const healthy = enabled.filter(r => !(this.cooldowns.get(r.id)?.until > Date.now()));
+    assert(healthy.length, '可用上游均在冷却中，请稍后重试', 503);
+    return healthy;
   }
-  best(rows) { return rows.reduce((a, b) => (this.currents.get(b.id) ?? 0) + b.weight > (this.currents.get(a.id) ?? 0) + a.weight ? b : a); }
-  lease(keyId, includeBusy = false) {
-    for (const [key, value] of this.leases) if (value.until < Date.now() && !this.activeKeys.has(key)) this.leases.delete(key);
-    const previous = this.leases.get(keyId);
-    if (previous) {
-      const row = this.rows().find(r => r.id === previous.id);
-      if (row?.enabled && row.weight > 0 && !row.reviews && !(this.cooldowns.get(row.id)?.until > Date.now())) return row;
-      this.leases.delete(keyId);
-    }
-    const candidates = this.available(includeBusy), idle = candidates.filter(r => !this.busy.has(r.id));
-    const row = this.best(idle.length ? idle : candidates);
-    this.leases.set(keyId, { id: row.id, until: Date.now() + 30000 });
+  pick(excluded = new Set(), pool = null) {
+    const rows = this.available().filter(r => !excluded.has(r.id) && (!pool || pool.ids.has(r.id)));
+    if (!rows.length) return null;
+    const length = Math.min(...rows.map(r => this.upstreamQueue.size(r.id)));
+    const candidates = rows.filter(r => this.upstreamQueue.size(r.id) === length).sort((a, b) => a.id - b.id);
+    const last = this.cursors.get(pool?.scope ?? 'pool') ?? 0;
+    return candidates.find(r => r.id > last) ?? candidates[0];
+  }
+  assertAvailable(id) {
+    const row = this.store.upstream(id);
+    assert(row?.enabled, '绑定或选定上游已停用或移除', 503);
+    assert(!(this.cooldowns.get(id)?.until > Date.now()), '绑定或选定上游正在冷却，请稍后重试', 503);
     return row;
   }
-  query(keyId) { return this.lease(keyId, true); }
-  acquire(keyId) {
-    assert(!this.activeKeys.has(keyId), '此访问密钥已有进行中的请求', 429);
-    const row = this.lease(keyId);
-    assert(!this.busy.has(row.id), '已查询额度的上游正在生成，请稍后重试', 429);
-    this.busy.add(row.id); this.activeKeys.add(keyId);
-    return { id: row.id, name: row.name, token: this.store.upstreamToken(row.id) };
+  async lockKey(id, signal) {
+    const unlock = await this.keyQueue.enter(id, signal); this.activeKeys.add(id);
+    return () => { this.activeKeys.delete(id); unlock(); };
   }
-  commit(id) {
-    const rows = this.rows().filter(r => r.enabled && r.weight > 0 && !r.reviews && !(this.cooldowns.get(r.id)?.until > Date.now()));
-    for (const row of rows) this.currents.set(row.id, (this.currents.get(row.id) ?? 0) + row.weight);
-    this.currents.set(id, (this.currents.get(id) ?? 0) - rows.reduce((n, r) => n + r.weight, 0));
+  async lockUpstream(id, signal) {
+    const unlock = await this.upstreamQueue.enter(id, signal); this.busy.add(id);
+    return () => { this.busy.delete(id); unlock(); };
   }
-  release(keyId, id) { this.busy.delete(id); this.activeKeys.delete(keyId); this.leases.delete(keyId); }
+  commit(id, pool = null) {
+    // Advance only when dispatching generation, so reads and skipped accounts do not consume turns.
+    this.cursors.set(pool?.scope ?? 'pool', id);
+  }
   failed(id, error, seconds = 30) { this.cooldowns.set(id, { until: Date.now() + seconds * 1000, error }); }
   reset(id) { this.cooldowns.delete(id); }
+  close() { this.keyQueue.close(); this.upstreamQueue.close(); }
 }

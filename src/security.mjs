@@ -23,7 +23,7 @@ export function unseal(value, key) {
   return Buffer.concat([decipher.update(data.subarray(12, -16)), decipher.final()]).toString('utf8');
 }
 export class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, code) { super(message); this.status = status; this.code = code; }
 }
 export const assert = (condition, message, status = 400) => { if (!condition) throw new HttpError(status, message); };
 export function integer(value, min, max, label = 'Anlas') {
