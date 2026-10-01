@@ -9,9 +9,10 @@ export function imageToolOutputSize(s) {
   const factor = Math.sqrt(3_145_728 / (s.width * s.height));
   return { width: Math.round(s.width * factor), height: Math.round(s.height * factor) };
 }
-export function upscaleCost(width, height) {
+export function upscaleCost(width, height, account = null) {
   const area = width * height;
   if (!Number.isFinite(area) || area <= 0 || area > 3145728) return null;
+  if (active(account) && account?.tier === 3 && area <= 640 * 640) return 0;
   return area <= 1048576 ? 1 : area <= 1747627 ? 2 : area <= 2446678 ? 3 : 4;
 }
 export const active = account => !!account && ([1, 2, 3, 4].includes(account.accountType ?? 0) ||

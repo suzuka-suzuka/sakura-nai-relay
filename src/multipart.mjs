@@ -1,4 +1,5 @@
 import { HttpError, assert } from './security.mjs';
+import { imageSize, base64Size } from './image-size.mjs';
 
 export function parseJson(bytes) {
   try {
@@ -66,4 +67,15 @@ export async function replaceMultipartRequest(form, body) {
   }
   const encoded = new Response(updated);
   return { payload: Buffer.from(await encoded.arrayBuffer()), type: encoded.headers.get('content-type') };
+}
+
+/** Reject mismatched infill canvases before reserving points or contacting an upstream. */
+export async function validateInpaintingImages(body, form = null) {
+  if (body.action !== 'infill') return;
+  const p = body.parameters;
+  assert(p && typeof p === 'object', '缺少生成参数');
+  for (const field of ['image', 'mask']) {
+    const size = form ? imageSize(Buffer.from(await imagePart(form, p[field]).arrayBuffer())) : base64Size(p[field]);
+    assert(size.width === p.width && size.height === p.height, field === 'mask' ? '重绘蒙版尺寸与生成画布不一致' : '重绘原图尺寸与生成画布不一致');
+  }
 }

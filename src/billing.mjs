@@ -65,7 +65,7 @@ export function reservation(path, body, subscription) {
     assert(typeof body.image === 'string' && body.image.length > 0 && models.has(body.model) && body.model.startsWith('nai-diffusion-4'), 'Vibe 编码参数无效');
     return 2;
   }
-  if (path === '/ai/upscale') { const cost = upscaleCost(body.width, body.height); assert(cost !== null, '放大尺寸无效'); return cost; }
+  if (path === '/ai/upscale') { const cost = upscaleCost(body.width, body.height, subscription); assert(cost !== null, '放大尺寸无效'); return cost; }
   if (path === '/ai/augment-image') {
     assert(['lineart', 'sketch', 'bg-removal', 'declutter', 'colorize', 'emotion'].includes(body.req_type), '不支持的图片处理类型');
     assert(typeof body.image === 'string' && body.image.length > 0, '缺少图片');
@@ -84,7 +84,19 @@ export function reservation(path, body, subscription) {
   assert(p.upscaled_enhance === undefined || typeof p.upscaled_enhance === 'boolean', 'Max 增强标记必须为布尔值');
   assert(!p.upscaled_enhance || v5 && body.action === 'img2img', 'Max 增强仅支持 V5 图生图');
   assert(body.action === 'generate' || typeof p.image === 'string', '缺少原图');
-  const strength = body.action === 'generate' ? 1 : body.action === 'infill' ? p.inpaintImg2ImgStrength : p.strength;
+  if (body.action === 'infill') {
+    assert(body.model === baseModel + '-inpainting', '局部重绘必须使用对应的 inpainting 模型');
+    if (p.img2img !== undefined) {
+      assert((v4 || v5) && p.img2img && typeof p.img2img === 'object' && !Array.isArray(p.img2img), '重绘 img2img 参数无效');
+      assert(Number.isFinite(p.img2img.strength) && p.img2img.strength >= 0 && p.img2img.strength <= 1, '重绘 img2img 强度无效');
+      assert(p.img2img.color_correct === undefined || typeof p.img2img.color_correct === 'boolean', '重绘颜色校正参数无效');
+      assert(p.inpaintImg2ImgStrength === undefined || p.inpaintImg2ImgStrength === p.img2img.strength, '重绘强度与 img2img.strength 不一致');
+    }
+    if (p.strength !== undefined) assert(Number.isFinite(p.strength) && p.strength >= 0 && p.strength <= 1, '图生图强度无效');
+  }
+  if (p.skip_cfg_above_sigma != null)
+    assert(!v5 && Number.isFinite(p.skip_cfg_above_sigma) && p.skip_cfg_above_sigma > 0, 'Variety+ 参数无效或当前模型不支持');
+  const strength = body.action === 'generate' ? 1 : body.action === 'infill' ? p.img2img?.strength ?? p.inpaintImg2ImgStrength ?? 1 : p.strength;
   assert(Number.isFinite(strength) && strength >= 0 && strength <= 1, '图生图强度无效');
   if (body.action !== 'generate' && p.noise !== undefined)
     assert(Number.isFinite(p.noise) && p.noise >= 0 && p.noise <= 1, '图生图噪声无效');

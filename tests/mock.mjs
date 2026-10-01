@@ -1,3 +1,4 @@
+import { deflateSync } from 'node:zlib';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 export const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jSuQAAAAASUVORK5CYII=';
@@ -51,4 +52,22 @@ export async function mockUpstream() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { server, state, origin: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); }) };
+}
+
+// Real opaque PNG canvases for request-size and multipart regression tests.
+export function canvasPng(width, height) {
+  const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
+  const chunk = (type, data) => {
+    const payload = Buffer.concat([Buffer.from(type), data]); let crc = 0xffffffff;
+    for (const byte of payload) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+    return Buffer.concat([u32(data.length), payload, u32((crc ^ 0xffffffff) >>> 0)]);
+  };
+  const raw = Buffer.alloc(height * (width * 4 + 1));
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const i = y * (width * 4 + 1) + 1 + x * 4;
+    raw[i] = raw[i + 1] = raw[i + 2] = raw[i + 3] = 255;
+  }
+  return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),
+    chunk('IHDR', Buffer.concat([u32(width),u32(height),Buffer.from([8,6,0,0,0])])),
+    chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }

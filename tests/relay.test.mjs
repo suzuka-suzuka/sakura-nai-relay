@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/server.mjs';
-import { mockUpstream, image } from './mock.mjs';
+import { mockUpstream, image, canvasPng } from './mock.mjs';
 import { Store } from '../src/db.mjs';
 import { reservation } from '../src/billing.mjs';
 import { decodeStreamEvents } from './msgpack-fixture.mjs';
@@ -55,8 +55,8 @@ test('Launcher 图生图和重绘保留源图、蒙版与缓存参数', async t 
     const request = payload(); request.action = action;
     if (action === 'infill') request.model += '-inpainting';
     Object.assign(request.parameters, { image: 'image', image_cache_secret_key: 'source-cache', strength: 0.2, noise: 0, inpaintImg2ImgStrength: 0.2 });
-    const parts = { image: bytes };
-    if (action === 'infill') { request.parameters.mask = 'mask'; request.parameters.mask_cache_secret_key = 'mask-cache'; parts.mask = bytes; }
+    const parts = { image: action === 'infill' ? canvasPng(832,1216) : bytes };
+    if (action === 'infill') { request.parameters.mask = 'mask'; request.parameters.mask_cache_secret_key = 'mask-cache'; parts.mask = canvasPng(832,1216); }
     assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request, parts))).status, 200);
     const call = generatedCalls(f).at(-1);
     assert.deepEqual(call.body, request); assert.deepEqual(call.parts, parts);
@@ -812,7 +812,7 @@ test('会员非 NAI5 按 Opus 本地计价且不锁定上游，放大不误判�
   assert.equal((await f.relay('/ai/generate-image',v45)).status,200);
   assert.equal(f.app.store.jobs()[0].charged,0); assert.equal(f.app.store.jobs()[0].upstream_id,second);
   assert.equal((await f.relay('/ai/upscale',{model:'nai-diffusion-5-curated',image})).status,200);
-  assert.equal(f.app.store.jobs()[0].charged,1); assert.equal(f.app.store.jobs()[0].route_mode,'anlas-pool');
+  assert.equal(f.app.store.jobs()[0].charged,0); assert.equal(f.app.store.jobs()[0].route_mode,'anlas-pool');
   assert.equal((await f.relay('/ai/generate-image',payload())).status,503);
 });
 
@@ -1053,9 +1053,9 @@ test('会员流式生图、Director、Vibe 和放大均可使用其他 Opus 账�
   assert.equal((await f.relay('/ai/upscale',{model:'nai-diffusion-5-curated',image})).status,200);
   const jobs=f.app.store.jobs(); assert.equal(jobs.length,4);
   assert.ok(jobs.every(j=>j.upstream_id===opus && j.status==='completed'));
-  assert.deepEqual(jobs.map(j=>j.route_mode),['anlas-pool','anlas-pool','opus-pool','opus-pool']);
-  assert.deepEqual(jobs.map(j=>j.charged),[1,2,0,0]);
-  assert.equal(f.app.store.key(f.key.id).balance,97);
+  assert.deepEqual(jobs.map(j=>j.route_mode),['opus-pool','anlas-pool','opus-pool','opus-pool']);
+  assert.deepEqual(jobs.map(j=>j.charged),[0,2,0,0]);
+  assert.equal(f.app.store.key(f.key.id).balance,98);
   assert.ok(f.mock.state.calls.every(c=>c.auth==='Bearer pst-tools-opus'));
 });
 
@@ -1122,7 +1122,7 @@ test('Anlas 池仅在余额足够的账号间轮询，不受零余额账号干�
   await addAccount(f,'pst-funded-a',{tier:1,balance:1000,cost:1});
   await addAccount(f,'pst-funded-b',{tier:3,balance:1000,cost:1});
   f.mock.state.calls=[];
-  for(let i=0;i<6;i++) assert.equal((await f.relay('/ai/upscale',{model:'nai-diffusion-5-curated',image})).status,200);
+  for(let i=0;i<6;i++) assert.equal((await f.relay('/ai/upscale',{model:'nai-diffusion-5-curated',image:canvasPng(832,1216).toString('base64')})).status,200);
   const calls=f.mock.state.calls.filter(c=>c.path==='/ai/upscale');
   assert.deepEqual(calls.map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-funded-b' : 'Bearer pst-funded-a'));
   assert.ok(f.app.store.jobs().every(j=>j.route_mode==='anlas-pool' && j.charged===1));
@@ -1330,5 +1330,42 @@ test('批量流只有部分 final 图片时返回失败事件，整笔请求释�
   const response=await f.relay('/ai/generate-image-stream',request), text=await response.text();
   assert.match(text,/event: final/); assert.match(text,/event: error/);
   const job=f.app.store.jobs()[0]; assert.equal(job.reserved,52); assert.equal(job.status,'failed'); assert.equal(job.charged,0);
+  assert.equal(f.app.store.key(f.key.id).balance,100); assert.equal(f.app.store.key(f.key.id).reserved,0);
+});
+
+test('前端扩图与细节重绘的 JSON 和表单请求在两种生成接口保留图片、蒙版与新增参数', async t => {
+  for (const model of ['nai-diffusion-4-5-full','nai-diffusion-5-full','nai-diffusion-5-curated']) await t.test(model,async t => {
+    const f=await fixture(t), bytes=canvasPng(1024,1024), png=bytes.toString('base64');
+    for (const streaming of [false,true]) for (const multipart of [false,true]) {
+      const path=streaming?'/ai/generate-image-stream':'/ai/generate-image';
+      const request={ model:model+'-inpainting',action:'infill',input:'extend the original scene',parameters:{
+        width:1024,height:1024,steps:28,n_samples:1,seed:17,stream:'msgpack',
+        image:multipart?'image':png,mask:multipart?'mask':png,strength:0.7,noise:0,
+        inpaintImg2ImgStrength:0.6,img2img:{strength:0.6,color_correct:true},add_original_image:false,
+        ...(model.includes('4-5')?{skip_cfg_above_sigma:58*Math.sqrt(1048576/(832*1216))}:{}) } };
+      const response=multipart?await sendForm(f,path,launcherForm(request,{image:bytes,mask:bytes})):await f.relay(path,request);
+      assert.equal(response.status,200); await response.arrayBuffer();
+      const call=f.mock.state.calls.filter(c=>c.path===path).at(-1);
+      assert.deepEqual(call.body,{...request,parameters:{...request.parameters,...(streaming?{stream:'sse'}:{})}});
+      if(multipart){assert.deepEqual(call.parts.image,bytes);assert.deepEqual(call.parts.mask,bytes);}
+      const expected=reservation(path,request,{tier:1,active:true});
+      assert.equal(f.app.store.jobs()[0].charged,expected); assert.equal(f.app.store.jobs()[0].status,'completed');
+    }
+  });
+});
+
+test('错误重绘画布和强度在上游查询与扣点前被拒绝', async t => {
+  const f=await fixture(t), bytes=canvasPng(1024,1024), png=bytes.toString('base64'); f.mock.state.calls=[];
+  const valid={model:'nai-diffusion-4-5-full-inpainting',action:'infill',parameters:{width:1024,height:1024,steps:28,n_samples:1,image:png,mask:png,strength:0.7,inpaintImg2ImgStrength:1}};
+  for(const changes of [
+    {image:canvasPng(512,768).toString('base64')}, {mask:canvasPng(512,768).toString('base64')},
+    {mask:''}, {img2img:{strength:0.5,color_correct:true}}, {skip_cfg_above_sigma:-1},
+  ]) assert.equal((await f.relay('/ai/generate-image',{...valid,parameters:{...valid.parameters,...changes}})).status,400);
+  assert.equal((await f.relay('/ai/generate-image',{...valid,model:'nai-diffusion-4-5-full'})).status,400);
+  for(const field of ['image','mask']) {
+    const parts={image:bytes,mask:bytes};parts[field]=canvasPng(512,768);
+    assert.equal((await sendForm(f,'/ai/generate-image-stream',launcherForm({...valid,parameters:{...valid.parameters,image:'image',mask:'mask'}},parts))).status,400);
+  }
+  assert.equal(f.mock.state.calls.length,0); assert.equal(f.app.store.jobs().length,0);
   assert.equal(f.app.store.key(f.key.id).balance,100); assert.equal(f.app.store.key(f.key.id).reserved,0);
 });

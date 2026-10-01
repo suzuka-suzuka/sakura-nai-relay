@@ -8,7 +8,7 @@ import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount
 import { upstreamClient, readBounded } from './upstream.mjs';
 import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
-import { parseJson as parse, parseMultipart, imagePart, validateGenerationParts, replaceMultipartRequest } from './multipart.mjs';
+import { parseJson as parse, parseMultipart, imagePart, validateGenerationParts, replaceMultipartRequest, validateInpaintingImages } from './multipart.mjs';
 import { encodeStreamEvent } from './msgpack.mjs';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
@@ -342,6 +342,7 @@ export function createApp(config) {
           assert(body.width === size.width && body.height === size.height, '声明尺寸与实际图片尺寸不符');
         }
       }
+      await validateInpaintingImages(body, form);
       // Drain uploads before queueing so the request-body timeout never includes queue wait.
       unlockKey = await router.lockKey(key.id, waiting.signal);
       // Validate the complete body before querying or occupying any upstream account.
@@ -414,7 +415,10 @@ export function createApp(config) {
         else res.end();
       }
     } catch (error) {
-      if (jobId) store.fail(jobId, '请求超时、中断或结果不完整，任务失败，已释放预留点数', status);
+      const transportCode = error.cause?.code ?? error.code;
+      const networkCode = typeof transportCode === 'string' && /^(UND_ERR_[A-Z_]+|E[A-Z]+)$/.test(transportCode) ? transportCode : null;
+      if (jobId) store.fail(jobId, `请求超时、中断或结果不完整${networkCode ? `（${networkCode}）` : ''}，任务失败，已释放预留点数`, status);
+      if (!(error instanceof HttpError)) console.error('上游请求异常', { endpoint: path, name: error.name, code: networkCode });
       if (res.headersSent && !res.destroyed && (msgpack || String(res.getHeader('Content-Type')).includes('text/event-stream'))) {
         const event = { event_type: 'error', error: '生成失败，未扣点数', requestId: jobId };
         res.end(msgpack ? encodeStreamEvent(event) : `event: error\ndata: ${JSON.stringify(event)}\n\n`);

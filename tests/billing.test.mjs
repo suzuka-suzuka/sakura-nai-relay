@@ -63,3 +63,29 @@ test('Max 仅接受 V5 图生图的布尔标记，独立放大和无效噪声仍
   }
   assert.equal(reservation('/ai/generate-image', enhancement({ upscaled_enhance: false }), opus), 0);
 });
+
+test('重绘按实际请求尺寸与嵌套强度收费，Variety+ 不加价', () => {
+  const request = { model:'nai-diffusion-4-5-full-inpainting', action:'infill',
+    parameters:{width:1536,height:1536,steps:28,n_samples:1,image:'source',mask:'mask',strength:0.7,inpaintImg2ImgStrength:1} };
+  assert.equal(reservation('/ai/generate-image',request,standard),45);
+  assert.equal(reservation('/ai/generate-image',request,opus),45);
+  request.parameters.skip_cfg_above_sigma=58*Math.sqrt(1536*1536/(832*1216));
+  assert.equal(reservation('/ai/generate-image',request,standard),45);
+  request.parameters.img2img={strength:0.6,color_correct:true};
+  assert.throws(()=>reservation('/ai/generate-image',request,standard),/不一致/);
+  request.parameters.inpaintImg2ImgStrength=0.6;
+  assert.equal(reservation('/ai/generate-image',request,standard),27);
+  delete request.parameters.inpaintImg2ImgStrength;
+  assert.equal(reservation('/ai/generate-image',request,standard),27);
+  request.model='nai-diffusion-5-full-inpainting';
+  delete request.parameters.skip_cfg_above_sigma;
+  assert.equal(reservation('/ai/generate-image',request,standard),41);
+  request.model='nai-diffusion-4-5-full';
+  assert.throws(()=>reservation('/ai/generate-image',request,standard),/inpainting/);
+});
+
+test('小图放大的会员免费规格与有效上游 Opus 相同', () => {
+  const price=(width,height,account)=>reservation('/ai/upscale',{width,height},account);
+  assert.equal(price(640,640,opus),0); assert.equal(price(512,512,standard),1);
+  assert.equal(price(640,704,opus),1); assert.equal(price(640,640,{tier:3,active:false}),1);
+});
