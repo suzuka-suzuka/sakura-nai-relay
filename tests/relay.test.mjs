@@ -203,6 +203,37 @@ test('CORS 预检、非法来源与未经许可的接口', async t => {
   assert.equal((await f.relay('/user/data')).status,404);
   assert.equal((await f.relay('/ai/generate',payload())).status,404);
 });
+
+test('允许所有来源支持跨域预检与请求，保留密钥及管理校验，可恢复来源限制', async t => {
+  const f = await fixture(t), allowedOrigins = ['*', 'https://listed.example'];
+  const saved = await f.call('/admin/api/settings','PUT',{enabled:true,origins:allowedOrigins});
+  assert.equal(saved.status,200);
+  assert.deepEqual((await (await f.call('/admin/api/snapshot')).json()).settings.origins,allowedOrigins);
+  const persisted = new Store(f.directory);
+  try { assert.deepEqual(JSON.parse(persisted.get('origins')),allowedOrigins); } finally { persisted.close(); }
+  for (const website of ['https://drawing.example', 'http://192.168.1.10:8080', 'null']) {
+    const pre = await fetch(f.base+'/ai/generate-image',{method:'OPTIONS',headers:{Origin:website,'Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'authorization, content-type'}});
+    assert.equal(pre.status,204); assert.equal(pre.headers.get('access-control-allow-origin'),website);
+    assert.equal(pre.headers.get('vary'),'Origin');
+    assert.match(pre.headers.get('access-control-allow-methods'),/POST/);
+    assert.match(pre.headers.get('access-control-allow-headers'),/Authorization/);
+    const response = await f.relay('/user/subscription',undefined,{Origin:website});
+    assert.equal(response.status,200); assert.equal(response.headers.get('access-control-allow-origin'),website);
+    const anonymous = await fetch(f.base+'/user/subscription',{headers:{Origin:website}});
+    assert.equal(anonymous.status,401); assert.equal(anonymous.headers.get('access-control-allow-origin'),website);
+  }
+  const generated = await f.relay('/ai/generate-image',payload(),{Origin:'https://drawing.example'});
+  assert.equal(generated.status,200); assert.equal(generated.headers.get('access-control-allow-origin'),'https://drawing.example');
+  await generated.arrayBuffer();
+  assert.equal((await f.call('/admin/api/settings','PUT',{enabled:true,origins:['*']},{Origin:'https://drawing.example'})).status,403);
+  assert.equal((await f.call('/admin/api/settings','PUT',{enabled:true,origins:['*']},{'X-CSRF-Token':''})).status,403);
+  for (const invalid of ['not-an-origin', 'https://drawing.example/path', 'http://drawing.example'])
+    assert.equal((await f.call('/admin/api/settings','PUT',{enabled:true,origins:[invalid]})).status,400);
+  assert.deepEqual(JSON.parse(f.app.store.get('origins')),allowedOrigins);
+  assert.equal((await f.call('/admin/api/settings','PUT',{enabled:true,origins:['https://listed.example']})).status,200);
+  assert.equal((await f.relay('/user/subscription',undefined,{Origin:'https://drawing.example'})).status,403);
+  assert.equal((await f.relay('/user/subscription',undefined,{Origin:'https://listed.example'})).status,200);
+});
 test('上游拒绝后释放 Anlas，敏感错误不回传，服务不自动重试', async t => {
   const f = await fixture(t); f.mock.state.fail = true;
   const res = await f.relay('/ai/generate-image',payload()); assert.equal(res.status,429); assert.ok(!(await res.text()).includes('pst-'));

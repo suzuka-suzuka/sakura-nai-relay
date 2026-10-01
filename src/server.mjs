@@ -160,6 +160,7 @@ export function createApp(config) {
       const body = parse(await readBody(req, 16384));
       assert(Array.isArray(body.origins) && body.origins.length <= 30, '允许的站点格式无效');
       const origins = [...new Set(body.origins.map(value => {
+        if (value === '*') return value;
         let u; try { u = new URL(value); } catch { throw new HttpError(400, '站点地址无效'); }
         assert(['https:', 'http:'].includes(u.protocol) && u.origin === value && !u.username && !u.password, '请填写完整站点来源，不含路径');
         assert(u.protocol === 'https:' || ['localhost','127.0.0.1','[::1]'].includes(u.hostname), '非本机站点必须使用 HTTPS'); return value;
@@ -417,7 +418,8 @@ export function createApp(config) {
       if (relayRoute) {
         const origin = req.headers.origin;
         if (origin) {
-          assert(options().origins.includes(origin) || origin === config.publicOrigin, '该网站未获准连接中转', 403);
+          const origins = options().origins;
+          assert(origins.includes('*') || origins.includes(origin) || origin === config.publicOrigin, '该网站未获准连接中转', 403);
           res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, Idempotency-Key');
