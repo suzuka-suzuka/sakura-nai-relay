@@ -236,7 +236,7 @@ document.addEventListener('click', async event => {
   if (action === 'edit-key') return keyForm(id);
   if (action === 'remove-key') return removeKey(id);
   if (action === 'add-upstream' || action === 'edit-upstream') return editUpstream(id);
-  if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
+  if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。已绑定会员将自动换绑到 NAI5 剩余额度最高的可用上游；没有可换绑账号时保留原上游。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
   if (action === 'points') return points(id);
   if (action === 'key-detail') return withButton(button, () => detail(id));
   if (action === 'job') return jobDetail(id);
@@ -246,7 +246,7 @@ document.addEventListener('click', async event => {
     if (action === 'refresh') { await refresh(); if (state.data.settings.configured) await quota(); }
     if (action === 'quota') await quota();
     if (action === 'toggle-upstream') { const row = state.data.upstreams.find(u => u.id === Number(id)); await api('/upstreams/'+id, { method:'PUT', body:{ name:row.name, enabled:!row.enabled } }); await refresh(); toast(row.enabled ? '上游已停用' : '上游已启用'); }
-    if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
+    if (action === 'confirm-remove-upstream') { const result = await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast(result.reboundKeys ? `上游已移除，${result.reboundKeys} 个会员已自动换绑` : '上游已移除'); }
     if (action === 'confirm-remove-key') { await api('/keys/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('密钥已删除，历史记录已保留'); }
     if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
     if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }

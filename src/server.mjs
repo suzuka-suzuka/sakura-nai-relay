@@ -123,9 +123,19 @@ export function createApp(config) {
       if (id !== null) editingUpstreams.add(id);
       try {
         if (req.method === 'DELETE') {
-          assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
-          store.retireUpstream(id); router.reset(id);
-          return json(res, 200, { ok: true });
+          const assertCanRemove = () => {
+            assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
+            assert(store.boundKeys(id).every(key => !router.keyQueue.size(key.id)), '请等待绑定会员的生成和排队结束，再移除上游', 409);
+          };
+          assertCanRemove();
+          const upstreamId = store.boundKeys(id).length ? await autoBindMember() : null;
+          assertCanRemove();
+          if (upstreamId !== null) {
+            router.assertAvailable(upstreamId);
+            assert(!editingUpstreams.has(upstreamId), '替代上游正在更新，请稍后重试', 409);
+          }
+          const reboundKeys = store.retireUpstream(id, upstreamId); router.reset(id);
+          return json(res, 200, { ok: true, reboundKeys, upstreamId });
         }
         const body = parse(await readBody(req, 16384));
         const name = label(body.name);

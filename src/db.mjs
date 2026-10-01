@@ -102,9 +102,21 @@ export class Store {
     }
     this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name, Number(enabled), id);
   }
-  retireUpstream(id) {
-    assert(!this.db.prepare('SELECT id FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL LIMIT 1').get(id), '该上游仍绑定会员密钥，请先改绑或调整等级', 409);
-    this.db.prepare('UPDATE upstreams SET enabled=0,retired_at=? WHERE id=?').run(Date.now(), id);
+  boundKeys(id) { return this.db.prepare('SELECT id,reserved FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL').all(id); }
+  retireUpstream(id, replacementId = null) {
+    return this.transaction(() => {
+      assert(this.upstream(id), '上游不存在', 404);
+      assert(!this.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
+      const bindings = this.boundKeys(id);
+      if (bindings.length) {
+        assert(replacementId !== id && this.upstream(replacementId ?? -1)?.enabled, '没有可换绑的上游，原上游未移除', 503);
+        const running = this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1");
+        assert(bindings.every(key => key.reserved === 0 && !running.get(key.id)), '请等待绑定会员的生成和排队结束，再移除上游', 409);
+        this.db.prepare('UPDATE keys SET nai5_upstream_id=? WHERE nai5_upstream_id=? AND retired_at IS NULL').run(replacementId, id);
+      }
+      this.db.prepare('UPDATE upstreams SET enabled=0,retired_at=? WHERE id=?').run(Date.now(), id);
+      return bindings.length;
+    });
   }
   hasUnsettled(id) { return !!this.db.prepare("SELECT id FROM jobs WHERE upstream_id=? AND status='running' LIMIT 1").get(id); }
   // Convenience for local fixtures; runtime routing always supplies an explicit upstream ID.

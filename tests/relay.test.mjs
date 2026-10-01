@@ -282,6 +282,88 @@ test('局部重绘与零强度图生图的参数和预留兼容', () => {
   request.model='nai-diffusion-5-full';request.action='img2img';request.parameters.strength=0;
   assert.equal(reservation('/ai/generate-image',request,account),2);
 });
+const maxEnhancePayload = () => ({
+  ...payload(), action: 'img2img', input: 'edited prompt',
+  parameters: { ...payload().parameters, steps: 28, image, strength: 0.2, noise: 0.12,
+    scale: 7, sampler: 'k_euler', upscaled_enhance: true },
+});
+
+test('V5 Full 与 Curated 的普通及流式 Max 增强按输出面积预留结算并保留请求参数', async t => {
+  const f = await fixture(t); f.mock.state.cost = 18;
+  for (const model of ['nai-diffusion-5-full', 'nai-diffusion-5-curated']) {
+    for (const path of ['/ai/generate-image', '/ai/generate-image-stream']) {
+      const request = { ...maxEnhancePayload(), model };
+      const response = await f.relay(path, request);
+      assert.equal(response.status, 200); await response.text();
+      const sent = f.mock.state.calls.findLast(c => c.path === path).body;
+      assert.equal(sent.model, model); assert.equal(sent.action, 'img2img'); assert.equal(sent.input, request.input);
+      for (const name of ['width', 'height', 'steps', 'n_samples', 'image', 'strength', 'noise', 'scale', 'sampler', 'upscaled_enhance'])
+        assert.equal(sent.parameters[name], request.parameters[name]);
+      const job = f.app.store.jobs()[0];
+      assert.equal(job.reserved, 18); assert.equal(job.charged, 18);
+      assert.equal(job.upstream_estimate, 18); assert.equal(job.upstream_spent, 18);
+      assert.equal(job.status, 'completed'); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+    }
+  }
+  assert.equal(f.app.store.key(f.key.id).balance, 28);
+});
+
+test('会员 Max 超出免费规格，绑定有无体力均跳过不足额和零余额上游', async t => {
+  for (const paid of [false, true]) await t.test(paid ? '绑定体力耗尽' : '绑定体力有效', async t => {
+    const f = await fixture(t); f.mock.state.paid = paid; f.mock.state.balance = 0; await member(f);
+    await addAccount(f, 'pst-poor-opus', { tier: 3, paid: false, balance: 17 });
+    const funded = await addAccount(f, 'pst-funded-max', { tier: 1, paid: true, balance: 18, cost: 18 });
+    f.mock.state.calls = [];
+    assert.equal((await f.relay('/ai/generate-image', maxEnhancePayload())).status, 200);
+    const job = f.app.store.jobs()[0];
+    assert.equal(job.charged, 18); assert.equal(job.upstream_estimate, 18); assert.equal(job.upstream_id, funded);
+    assert.equal(job.route_mode, paid ? 'nai5-paid-pool' : 'anlas-pool');
+    assert.equal(f.app.store.key(f.key.id).balance, 82);
+    assert.equal(f.mock.state.balance, 0); assert.equal(f.mock.state.accounts.get('pst-poor-opus').balance, 17);
+    assert.equal(generatedCalls(f).length, 1); assert.equal(generatedCalls(f)[0].auth, 'Bearer pst-funded-max');
+  });
+});
+
+test('Max 按输出面积检查下游余额，17 Anlas 不足时生成前拒绝', async t => {
+  const f = await fixture(t); f.app.store.adjust(f.key.id, -83, '只留 17 Anlas');
+  for (const path of ['/ai/generate-image', '/ai/generate-image-stream']) {
+    const response = await f.relay(path, maxEnhancePayload());
+    assert.equal(response.status, 402); assert.match(await response.text(), /18 Anlas/);
+  }
+  assert.equal(f.mock.state.calls.filter(c => c.path.startsWith('/ai/')).length, 0);
+  assert.equal(f.app.store.jobs().length, 0); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  assert.equal(f.app.store.key(f.key.id).balance, 17);
+});
+
+test('Max 上游拒绝或流式缺少最终图片时释放全部预留，不计入用量', async t => {
+  for (const streaming of [false, true]) await t.test(streaming ? '流式断流' : '上游拒绝', async t => {
+    const f = await fixture(t); f.mock.state.cost = 18;
+    if (streaming) f.mock.state.incomplete = true; else f.mock.state.fail = true;
+    const path = streaming ? '/ai/generate-image-stream' : '/ai/generate-image';
+    const response = await f.relay(path, maxEnhancePayload());
+    assert.equal(response.status, streaming ? 200 : 429);
+    const text = await response.text(); if (streaming) assert.match(text, /event: error/);
+    const job = f.app.store.jobs()[0];
+    assert.equal(job.reserved, 18); assert.equal(job.charged, 0); assert.equal(job.upstream_spent, 0);
+    assert.equal(job.status, 'failed'); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+    assert.equal(f.app.store.key(f.key.id).balance, 100);
+    assert.equal(f.mock.state.calls.filter(c => c.path === path).length, 1);
+  });
+});
+
+test('不支持的 Max 请求在查询上游和预留余额前拒绝', async t => {
+  const f = await fixture(t); f.mock.state.calls = [];
+  for (const change of [{ model: 'nai-diffusion-4-5-full' }, { action: 'generate' },
+    { parameters: { upscaled_enhance: 'true' } }, { parameters: { noise: 1.1 } },
+    { parameters: { steps: 50, strength: 0.99 } }]) {
+    const request = maxEnhancePayload();
+    const parameters = { ...request.parameters, ...change.parameters };
+    Object.assign(request, change, { parameters });
+    assert.equal((await f.relay('/ai/generate-image', request)).status, 400);
+  }
+  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+});
+
 test('上游查询失败不发起生成，失效会话及暂停中转正确拒绝', async t => {
   const f=await fixture(t);f.mock.state.queryFails=true;
   assert.equal((await f.relay('/ai/generate-image',payload())).status,502);
@@ -466,7 +548,7 @@ async function waitFor(check) {
   assert.fail('等待状态超时');
 }
 
-test('会员必须绑定；普通不能绑定；绑定中的上游不能移除', async t => {
+test('会员必须绑定；普通不能绑定；没有替代账号时保留绑定上游', async t => {
   const f=await fixture(t);
   for(const options of [{tier:'standard',upstreamId:1},{tier:'unknown'}])
     assert.equal((await f.call('/admin/api/keys','POST',{name:'无效',points:100,...options})).status,400);
@@ -474,7 +556,9 @@ test('会员必须绑定；普通不能绑定；绑定中的上游不能移除',
     assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',options)).status,400);
   await member(f);
   assert.equal(f.app.store.upstreams()[0].bound_keys,1);
-  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,409);
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,503);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,1);
+  assert.equal(f.app.store.upstream(1).enabled,1);
   assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',{tier:'standard',upstreamId:null})).status,200);
   assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,null);
   assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);
@@ -886,6 +970,127 @@ test('所有有效 Opus 体力为零仍可自动绑定，没有有效 Opus 则�
   const before=f.app.store.keys().length;
   assert.equal((await f.call('/admin/api/keys','POST',{name:'无可绑定账号',points:100,tier:'member'})).status,503);
   assert.equal(f.app.store.keys().length,before);
+});
+
+test('删除绑定上游实时选择最高有效 NAI5 额度，批量换绑并保留密钥与历史', async t => {
+  const f=await fixture(t); await member(f); f.mock.state.paid=false; f.mock.state.usagePercent=100;
+  assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
+  const paused=f.app.store.createKey('停用会员',88,{tier:'member',upstreamId:1,validDays:30});
+  f.app.store.updateKey(paused.id,{enabled:false});
+  const expired=f.app.store.createKey('过期会员',77,{tier:'member',upstreamId:1,expiresAt:Date.now()-1});
+  const retired=f.app.store.createKey('已删除会员',66,{tier:'member',upstreamId:1}); f.app.store.retireKey(retired.id);
+  const standard=f.app.store.createKey('普通会员不变',55);
+  const best=await addAccount(f,'pst-delete-best',{paid:false,usagePercent:10,balance:0});
+  await addAccount(f,'pst-delete-less',{paid:false,usagePercent:80});
+  await addAccount(f,'pst-delete-paused',{paid:false,usagePercent:100,enabled:false});
+  await addAccount(f,'pst-delete-non-opus',{paid:false,usagePercent:100,tier:1});
+  await addAccount(f,'pst-delete-inactive',{paid:false,usagePercent:100,active:false,expiresAt:0});
+  await addAccount(f,'pst-delete-expired',{paid:false,usagePercent:100,expiresAt:Date.now()/1000-1});
+  await addAccount(f,'pst-delete-negative',{paid:false,usagePercent:100,usageNegative:true});
+  const cooling=await addAccount(f,'pst-delete-cooling',{paid:false,usagePercent:100}); f.app.router.failed(cooling,'测试冷却');
+  await addAccount(f,'pst-delete-failed',{paid:false,usagePercent:100}); f.mock.state.accounts.get('pst-delete-failed').queryFails=true;
+  f.mock.state.accounts.get('pst-delete-best').usagePercent=94;
+  const keys=[f.key,paused,expired].map(key=>f.app.store.key(key.id)), jobs=f.app.store.jobs(), ledger=f.app.store.ledger();
+  f.mock.state.queryFails=true; f.mock.state.calls=[];
+  const response=await f.call('/admin/api/upstreams/1','DELETE');
+  assert.equal(response.status,200); assert.deepEqual(await response.json(),{ok:true,reboundKeys:3,upstreamId:best});
+  assert.equal(f.app.store.upstream(1),undefined); assert.equal(f.app.store.upstreams().find(u=>u.id===best).bound_keys,3);
+  for(const key of keys) assert.deepEqual({...f.app.store.key(key.id)},{...key,nai5_upstream_id:best});
+  assert.equal(f.app.store.key(standard.id).nai5_upstream_id,null);
+  assert.equal(f.app.store.db.prepare('SELECT nai5_upstream_id FROM keys WHERE id=?').get(retired.id).nai5_upstream_id,1);
+  assert.deepEqual(f.app.store.jobs(),jobs); assert.deepEqual(f.app.store.ledger(),ledger);
+  assert.ok(!f.mock.state.calls.some(call=>call.auth==='Bearer pst-local-test'));
+  const subscription=await (await f.relay('/user/subscription')).json();
+  assert.equal(subscription.relay.nai5UpstreamId,best); assert.equal(subscription.usage.percent,94);
+  assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
+  assert.equal(generatedCalls(f)[0].auth,'Bearer pst-delete-best');
+  assert.equal(f.app.store.jobs()[0].route_mode,'nai5-bound'); assert.equal(f.app.store.key(f.key.id).balance,100);
+});
+
+test('删除绑定上游时有效额度同为零按账号 ID 换绑', async t => {
+  const f=await fixture(t); await member(f);
+  const first=await addAccount(f,'pst-delete-zero',{paid:false,usagePercent:0});
+  await addAccount(f,'pst-delete-negative-tie',{paid:true,usagePercent:100,usageNegative:true});
+  const response=await f.call('/admin/api/upstreams/1','DELETE');
+  assert.equal(response.status,200); assert.equal((await response.json()).upstreamId,first);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,first);
+});
+
+test('替代账号查询失败时删除保留全部绑定，无绑定上游可直接删除', async t => {
+  const f=await fixture(t); await member(f);
+  const other=f.app.store.createKey('另一绑定会员',0,{tier:'member',upstreamId:1});
+  const fallback=await addAccount(f,'pst-delete-query-fail',{paid:false});
+  f.mock.state.accounts.get('pst-delete-query-fail').queryFails=true;
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,503);
+  assert.equal(f.app.store.upstream(1).enabled,1);
+  for(const key of [f.key,other]) assert.equal(f.app.store.key(key.id).nai5_upstream_id,1);
+  f.mock.state.calls=[];
+  const response=await f.call('/admin/api/upstreams/'+fallback,'DELETE');
+  assert.equal(response.status,200); assert.deepEqual(await response.json(),{ok:true,reboundKeys:0,upstreamId:null});
+  assert.equal(f.mock.state.calls.length,0);
+});
+
+test('绑定会员在其他上游执行或排队时拒绝删除原上游，结束后自动换绑', async t => {
+  const f=await fixture(t); await member(f); f.mock.state.paid=false; f.mock.state.balance=0;
+  const best=await addAccount(f,'pst-delete-running',{paid:false,usagePercent:90,balance:1000,slow:200});
+  const request=payload(); Object.assign(request.parameters,{width:1024,height:1536});
+  const first=f.relay('/ai/generate-image',request); await waitFor(()=>generatedCalls(f).length===1);
+  assert.equal(f.app.router.busy.has(1),false); assert.equal(f.app.router.busy.has(best),true);
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,409);
+  const second=f.relay('/ai/generate-image',request); await waitFor(()=>f.app.router.keyQueue.size(f.key.id)===2);
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,409);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,1);
+  assert.deepEqual((await Promise.all([first,second])).map(response=>response.status),[200,200]);
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,best);
+});
+
+test('自动换绑额度查询期间重新检查会员队列，失败后可再次删除', async t => {
+  let armed=false, entered, resume;
+  const queried=new Promise(resolve=>{entered=resolve;}), gate=new Promise(resolve=>{resume=resolve;});
+  const f=await fixture(t,{fetcher:async (url,options)=>{
+    const response=await fetch(url,options);
+    if(armed && options.headers.Authorization==='Bearer pst-delete-race'){entered();await gate;}
+    return response;
+  }});
+  await member(f); const best=await addAccount(f,'pst-delete-race',{paid:false,usagePercent:90}); armed=true;
+  const pending=f.call('/admin/api/upstreams/1','DELETE'); await queried;
+  const unlock=await f.app.router.lockKey(f.key.id);
+  try {
+    resume(); assert.equal((await pending).status,409);
+    assert.equal(f.app.store.upstream(1).enabled,1); assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,1);
+  } finally { unlock(); resume(); }
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,best);
+});
+
+test('自动换绑查询期间停用最高额度账号时选择其他有效上游', async t => {
+  let armed=false, entered, resume;
+  const queried=new Promise(resolve=>{entered=resolve;}), gate=new Promise(resolve=>{resume=resolve;});
+  const f=await fixture(t,{fetcher:async (url,options)=>{
+    const response=await fetch(url,options);
+    if(armed && options.headers.Authorization==='Bearer pst-delete-disabled-race'){entered();await gate;}
+    return response;
+  }});
+  await member(f); const best=await addAccount(f,'pst-delete-disabled-race',{paid:false,usagePercent:90});
+  const fallback=await addAccount(f,'pst-delete-race-fallback',{paid:false,usagePercent:40}); armed=true;
+  const pending=f.call('/admin/api/upstreams/1','DELETE'); await queried;
+  try { assert.equal((await f.call('/admin/api/upstreams/'+best,'PUT',{name:'已停用',enabled:false})).status,200); }
+  finally { resume(); }
+  assert.equal((await pending).status,200); assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,fallback);
+});
+
+test('自动换绑与删除同一事务，删除失败时所有会员绑定回滚', async t => {
+  const f=await fixture(t); await member(f);
+  const other=f.app.store.createKey('一同回滚',0,{tier:'member',upstreamId:1});
+  const best=await addAccount(f,'pst-delete-rollback',{paid:false});
+  f.app.store.db.exec("CREATE TRIGGER fail_retire BEFORE UPDATE OF retired_at ON upstreams WHEN NEW.id=1 BEGIN SELECT RAISE(ABORT,'test rollback'); END;");
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,502);
+  assert.equal(f.app.store.upstream(1).enabled,1);
+  for(const key of [f.key,other]) assert.equal(f.app.store.key(key.id).nai5_upstream_id,1);
+  f.app.store.db.exec('DROP TRIGGER fail_retire;');
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);
+  for(const key of [f.key,other]) assert.equal(f.app.store.key(key.id).nai5_upstream_id,best);
 });
 
 test('七天双柱只统计自动成功结算的本地用量，失败不计入上下游消耗', async t => {
