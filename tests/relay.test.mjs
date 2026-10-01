@@ -7,9 +7,10 @@ import { createApp } from '../src/server.mjs';
 import { mockUpstream, image } from './mock.mjs';
 import { Store } from '../src/db.mjs';
 import { reservation } from '../src/billing.mjs';
+import { decodeStreamEvents } from './msgpack-fixture.mjs';
 
 const origin = 'http://127.0.0.1:3100';
-export const payload = () => ({ model:'nai-diffusion-5-full', action:'generate', input:'test', parameters:{ width:832, height:1216, steps:23, n_samples:1, stream:'msgpack' } });
+export const payload = () => ({ model:'nai-diffusion-5-full', action:'generate', input:'test', parameters:{ width:832, height:1216, steps:23, n_samples:1, stream:'sse' } });
 export async function fixture(t, config = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'sakura-relay-test-')), mock = await mockUpstream();
   const app = createApp({ dataDir:directory, publicOrigin:origin, upstreamOrigin:mock.origin, ...config });
@@ -28,6 +29,157 @@ export async function fixture(t, config = {}) {
   t.after(async () => { await app.close(); await mock.close(); rmSync(directory,{recursive:true,force:true}); });
   return { app,mock,base,call,relay,key,directory,cookie,csrf };
 }
+
+function launcherForm(body, parts = {}) {
+  const form = new FormData();
+  for (const [name, bytes] of Object.entries(parts)) form.append(name, new Blob([bytes], { type: 'image/png' }), 'blob');
+  form.append('request', new Blob([JSON.stringify(body)], { type: 'application/json' }), 'blob');
+  return form;
+}
+const sendForm = (f, path, form) => fetch(f.base + path, { method: 'POST', headers: { Authorization: 'Bearer ' + f.key.token }, body: form });
+
+test('Launcher 纯 request 的 multipart 文生图可生成，原表单完整转发并正常计费', async t => {
+  const f = await fixture(t), request = payload(), form = launcherForm(request);
+  const encoded = new Response(form), type = encoded.headers.get('content-type'), raw = Buffer.from(await encoded.arrayBuffer());
+  const response = await fetch(f.base + '/ai/generate-image', { method: 'POST', headers: { Authorization: 'Bearer ' + f.key.token, 'Content-Type': type }, body: raw });
+  assert.equal(response.status, 200);
+  assert.deepEqual(generatedCalls(f)[0].body, request);
+  assert.deepEqual(generatedCalls(f)[0].raw, raw);
+  assert.equal(generatedCalls(f)[0].contentType, type);
+  assert.equal(f.app.store.key(f.key.id).balance, 74);
+});
+
+test('Launcher 图生图和重绘保留源图、蒙版与缓存参数', async t => {
+  const f = await fixture(t), bytes = Buffer.from(image, 'base64');
+  for (const action of ['img2img', 'infill']) {
+    const request = payload(); request.action = action;
+    if (action === 'infill') request.model += '-inpainting';
+    Object.assign(request.parameters, { image: 'image', image_cache_secret_key: 'source-cache', strength: 0.2, noise: 0, inpaintImg2ImgStrength: 0.2 });
+    const parts = { image: bytes };
+    if (action === 'infill') { request.parameters.mask = 'mask'; request.parameters.mask_cache_secret_key = 'mask-cache'; parts.mask = bytes; }
+    assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request, parts))).status, 200);
+    const call = generatedCalls(f).at(-1);
+    assert.deepEqual(call.body, request); assert.deepEqual(call.parts, parts);
+    assert.equal(f.app.store.jobs()[0].charged, reservation('/ai/generate-image', request, { tier: 1, active: true }));
+  }
+});
+
+test('Launcher 缓存参考图按条目数计费，图片去重不减少附加费用', async t => {
+  for (const field of ['director_reference_images', 'reference_image_multiple']) await t.test(field, async t => {
+    const f = await fixture(t), bytes = Buffer.from(image, 'base64'), request = payload(); request.model = 'nai-diffusion-4-5-full';
+    request.parameters[field + '_cached'] = [{ data: 'ref', cache_secret_key: 'one' }, { data: 'ref', cache_secret_key: 'one' }];
+    const canonical = structuredClone(request); delete canonical.parameters[field + '_cached']; canonical.parameters[field] = [image, image];
+    const price = reservation('/ai/generate-image', canonical, { tier: 1, active: true });
+    assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request, { ref: bytes }))).status, 200);
+    assert.deepEqual(generatedCalls(f)[0].body, request);
+    assert.deepEqual(generatedCalls(f)[0].parts.ref, bytes);
+    assert.equal(f.app.store.jobs()[0].charged, price);
+    assert.equal(f.app.store.key(f.key.id).balance, 100 - price);
+  });
+});
+
+test('缓存参考图不能绕过模型限制、互斥规则或余额检查，JSON 同样按缓存字段计费', async t => {
+  const f = await fixture(t), bytes = Buffer.from(image, 'base64'); f.mock.state.calls = [];
+  for (const field of ['director_reference_images_cached', 'reference_image_multiple_cached']) {
+    const request = payload(); request.parameters[field] = [{ data: 'ref' }];
+    assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request, { ref: bytes }))).status, 400);
+  }
+  const request = payload(); request.model = 'nai-diffusion-4-5-full'; request.parameters.director_reference_images_cached = [{ data: 'ref' }];
+  for (const extra of [{ director_reference_images: [image] }, { reference_image_multiple_cached: [{ data: 'ref' }] }]) {
+    const invalid = structuredClone(request); Object.assign(invalid.parameters, extra);
+    assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(invalid, { ref: bytes }))).status, 400);
+  }
+  await f.call('/admin/api/keys/' + f.key.id + '/points', 'POST', { delta: -99, note: '低余额' });
+  assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request, { ref: bytes }))).status, 402);
+  request.parameters.director_reference_images_cached[0].data = image;
+  assert.equal((await f.relay('/ai/generate-image', request)).status, 402);
+  assert.equal(f.mock.state.calls.filter(call => call.path.includes('generate-image')).length, 0);
+  assert.equal(f.app.store.key(f.key.id).reserved, 0);
+});
+
+test('Launcher Vibe 编码、图像处理和放大表单都可转发，图片处理校验实际尺寸', async t => {
+  const f = await fixture(t), bytes = Buffer.from(image, 'base64');
+  const requests = [
+    ['/ai/encode-vibe', { image: 'image', model: 'nai-diffusion-4-5-full', information_extracted: 1 }],
+    ['/ai/augment-image', { image: 'image', req_type: 'lineart', width: 1, height: 1 }],
+    ['/ai/upscale', { image: 'image', model: 'nai-diffusion-5-curated' }],
+  ];
+  // Augment requires at least 64 pixels; use a PNG header declaring 64x64 for this local fixture.
+  const toolImage = Buffer.from(bytes); toolImage.writeUInt32BE(64, 16); toolImage.writeUInt32BE(64, 20);
+  requests[1][1].width = 64; requests[1][1].height = 64;
+  for (const [path, request] of requests) {
+    const part = path === '/ai/augment-image' ? toolImage : bytes;
+    const response = await sendForm(f, path, launcherForm(request, { image: part }));
+    assert.equal(response.status, 200);
+    const call = f.mock.state.calls.findLast(call => call.path === path);
+    assert.deepEqual(call.body, request); assert.deepEqual(call.parts.image, part);
+  }
+  const invalid = { image: 'image', req_type: 'lineart', width: 1024, height: 1024 };
+  assert.equal((await sendForm(f, '/ai/augment-image', launcherForm(invalid, { image: bytes }))).status, 400);
+  assert.equal(f.mock.state.calls.filter(call => call.path === '/ai/augment-image').length, 1);
+});
+
+test('无效表单、缺少图片、重复分块和错误媒体类型在访问上游前拒绝', async t => {
+  const f = await fixture(t); f.mock.state.calls = [];
+  const missing = new FormData(), invalidJson = new FormData(), duplicate = launcherForm(payload());
+  invalidJson.append('request', '{broken'); duplicate.append('request', '{}');
+  const request = payload(); request.action = 'img2img'; Object.assign(request.parameters, { image: 'missing', strength: 0.5 });
+  const forms = [missing, invalidJson, duplicate, launcherForm(request)];
+  for (const form of forms) assert.equal((await sendForm(f, '/ai/generate-image', form)).status, 400);
+  const text = new FormData(); text.append('request', JSON.stringify(payload()));
+  assert.equal((await sendForm(f, '/ai/generate-image', text)).status, 200);
+  f.mock.state.calls = [];
+  const bad = await fetch(f.base + '/ai/generate-image', { method: 'POST', headers: { Authorization: 'Bearer ' + f.key.token, 'Content-Type': 'multipart/form-data' }, body: 'no boundary' });
+  assert.equal(bad.status, 400);
+  assert.equal((await f.relay('/ai/generate-image', payload(), { 'Content-Type': 'text/plain' })).status, 415);
+  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+});
+
+test('Launcher multipart 实时预览接收 MessagePack，SSE 参数重写保留图片和缓存字段', async t => {
+  const f = await fixture(t), request = payload(), bytes = Buffer.from(image, 'base64');
+  request.action = 'img2img'; Object.assign(request.parameters, { stream: 'msgpack', image: 'image', image_cache_secret_key: 'cache', strength: 0.2 });
+  const response = await sendForm(f, '/ai/generate-image-stream', launcherForm(request, { image: bytes }));
+  assert.equal(response.status, 200); assert.equal(response.headers.get('content-type'), 'application/x-msgpack');
+  const events = decodeStreamEvents(Buffer.from(await response.arrayBuffer()));
+  assert.deepEqual(events.map(event => event.event_type), ['intermediate', 'final']);
+  assert.equal(events[1].samp_ix, 0); assert.equal(events[1].image, image);
+  const call = f.mock.state.calls.find(call => call.path.endsWith('-stream'));
+  assert.deepEqual(call.parts.image, bytes);
+  assert.deepEqual(call.body, { ...request, parameters: { ...request.parameters, stream: 'sse' } });
+  assert.equal(f.app.store.jobs()[0].status, 'completed'); assert.equal(f.app.store.jobs()[0].charged, 6);
+});
+
+test('JSON MessagePack 请求也按客户端格式响应，SSE 分块、UTF-8 和无终止空行正常转换', async t => {
+  const f = await fixture(t), request = payload(); request.parameters.stream = 'msgpack';
+  const final = { event_type: 'final', samp_ix: 0, image, text: '樱花' }, raw = Buffer.from('event: final\ndata: ' + JSON.stringify(final));
+  f.mock.state.streamChunks = Array.from(raw, byte => Buffer.from([byte]));
+  const response = await f.relay('/ai/generate-image-stream', request);
+  assert.deepEqual(decodeStreamEvents(Buffer.from(await response.arrayBuffer())), [final]);
+  assert.equal(f.app.store.jobs()[0].status, 'completed'); assert.equal(f.app.store.key(f.key.id).balance, 74);
+});
+
+test('MessagePack 缺图、畸形事件、上游错误和缺少批量结果都失败并释放预留', async t => {
+  const f = await fixture(t), request = payload(); request.parameters.stream = 'msgpack';
+  const scenarios = [
+    ['event: intermediate\ndata: {"event_type":"intermediate","samp_ix":0}\n\n'],
+    ['event: final\ndata: {broken}\n\n'],
+    ['event: final\ndata: ' + JSON.stringify({ event_type: 'final', samp_ix: 0, image }) + '\n\nevent: error\ndata: {"event_type":"error","error":"failed"}\n\n'],
+  ];
+  for (const chunks of scenarios) {
+    f.mock.state.streamChunks = chunks;
+    const response = await sendForm(f, '/ai/generate-image-stream', launcherForm(request));
+    const events = decodeStreamEvents(Buffer.from(await response.arrayBuffer()));
+    assert.equal(events.at(-1).event_type, 'error'); assert.equal(events.at(-1).error, '生成失败，未扣点数');
+    const job = f.app.store.jobs()[0]; assert.equal(job.status, 'failed'); assert.equal(job.charged, 0);
+    assert.equal(f.app.store.key(f.key.id).balance, 100); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  }
+  f.mock.state.streamChunks = null; request.parameters.n_samples = 2; f.mock.state.finalCount = 1;
+  const response = await sendForm(f, '/ai/generate-image-stream', launcherForm(request));
+  assert.equal(decodeStreamEvents(Buffer.from(await response.arrayBuffer())).at(-1).event_type, 'error');
+  assert.equal(f.app.store.key(f.key.id).balance, 100); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  f.mock.state.finalCount = undefined; request.parameters.n_samples = 1;
+  assert.equal((await sendForm(f, '/ai/generate-image', launcherForm(request))).status, 200);
+});
 
 test('管理员鉴权、CSRF、一次性初始化、登录密码与响应脱敏', async t => {
   const f = await fixture(t);

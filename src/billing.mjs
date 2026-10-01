@@ -52,6 +52,12 @@ function dimensions(p) {
   return p.width * p.height;
 }
 function arrayLength(value, limit = 16) { if (value === undefined) return 0; assert(Array.isArray(value) && value.length <= limit, '参考图数量无效'); return value.length; }
+function referenceCount(parameters, field) {
+  const plain = arrayLength(parameters[field]), cached = arrayLength(parameters[field + '_cached']);
+  assert(!plain || !cached, '同类参考图不能同时使用普通与缓存字段');
+  if (cached) assert(parameters[field + '_cached'].every(item => item && typeof item.data === 'string' && item.data.length > 0), '缓存参考图参数无效');
+  return plain + cached;
+}
 
 /** Authoritative local price. Upstream routing uses the same formula with the real account. */
 export function reservation(path, body, subscription) {
@@ -83,7 +89,7 @@ export function reservation(path, body, subscription) {
   if (body.action !== 'generate' && p.noise !== undefined)
     assert(Number.isFinite(p.noise) && p.noise >= 0 && p.noise <= 1, '图生图噪声无效');
   if (body.action === 'infill') assert(typeof p.mask === 'string' && p.mask.length > 0, '缺少重绘蒙版');
-  const director = arrayLength(p.director_reference_images), vibes = arrayLength(p.reference_image_multiple);
+  const director = referenceCount(p, 'director_reference_images'), vibes = referenceCount(p, 'reference_image_multiple');
   assert(!p.sm_dyn, '暂不支持动态 SMEA 计价，请使用普通 SMEA');
   assert(!director || baseModel.includes('4-5') && body.action !== 'infill', '当前模型或生成方式不支持角色参考图');
   assert(!vibes || !v5 && body.action !== 'infill', '当前模型或生成方式不支持 Vibe');
@@ -97,9 +103,9 @@ export function reservation(path, body, subscription) {
   return estimate.total;
 }
 
-/** We request SSE from upstream for streaming; the existing frontend supports it natively. */
+/** Validate upstream SSE before settlement; optionally expose parsed events to a client encoder. */
 export class StreamCheck {
-  constructor(expected) { this.expected = expected; this.buffer = ''; this.decoder = new TextDecoder(); this.finals = new Set(); this.failed = false; }
+  constructor(expected, onEvent = null) { this.expected = expected; this.onEvent = onEvent; this.buffer = ''; this.decoder = new TextDecoder(); this.finals = new Set(); this.failed = false; }
   feed(bytes) {
     this.buffer += this.decoder.decode(bytes, { stream: true });
     assert(this.buffer.length < 64 * 1024 * 1024, '上游流式事件过大', 502);
@@ -112,14 +118,16 @@ export class StreamCheck {
     const lines = record.split(/\r?\n/), kind = lines.find(l => l.startsWith('event:'))?.slice(6).trim();
     const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
     if (!data || data === '[DONE]') return;
-    try {
-      const parsed = JSON.parse(data), type = parsed.event_type ?? kind;
-      if (type === 'error' || parsed.error) this.failed = true;
-      if (type === 'final') {
-        if (!Number.isInteger(parsed.samp_ix) || parsed.samp_ix < 0 || parsed.samp_ix >= this.expected || !parsed.image) this.failed = true;
-        else this.finals.add(parsed.samp_ix);
-      }
-    } catch { this.failed = true; }
+    let parsed;
+    try { parsed = JSON.parse(data); } catch { this.failed = true; return; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { this.failed = true; return; }
+    const type = parsed.event_type ?? kind;
+    if (type === 'error' || parsed.error) this.failed = true;
+    if (type === 'final') {
+      if (!Number.isInteger(parsed.samp_ix) || parsed.samp_ix < 0 || parsed.samp_ix >= this.expected || !parsed.image) this.failed = true;
+      else this.finals.add(parsed.samp_ix);
+    }
+    this.onEvent?.({ ...parsed, ...(type ? { event_type: type } : {}) });
   }
   complete() { this.buffer += this.decoder.decode(); if (this.buffer.trim()) this.record(this.buffer); return !this.failed && this.finals.size === this.expected; }
 }

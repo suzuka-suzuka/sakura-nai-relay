@@ -8,6 +8,8 @@ import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount
 import { upstreamClient, readBounded } from './upstream.mjs';
 import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
+import { parseJson as parse, parseMultipart, imagePart, validateGenerationParts, replaceMultipartRequest } from './multipart.mjs';
+import { encodeStreamEvent } from './msgpack.mjs';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const PAID = new Set(['/ai/generate-image', '/ai/generate-image-stream', '/ai/encode-vibe', '/ai/augment-image', '/ai/upscale']);
@@ -19,7 +21,6 @@ async function readBody(req, max) {
   for await (const chunk of req) { size += chunk.length; assert(size <= max, '请求内容过大', 413); chunks.push(chunk); }
   return Buffer.concat(chunks);
 }
-function parse(bytes) { try { const value = JSON.parse(bytes.toString()); assert(value && typeof value === 'object' && !Array.isArray(value), '需要 JSON 对象'); return value; } catch { throw new HttpError(400, 'JSON 格式无效'); } }
 const label = (value, max = 64) => { assert(typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max, `请输入 1–${max} 字的名称或备注`); return value.trim(); };
 const cookieToken = (req) => req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('sakura_session='))?.slice(15);
 
@@ -309,19 +310,28 @@ export function createApp(config) {
   async function paid(req, res, path, key) {
     const waiting = new AbortController();
     const onClose = () => waiting.abort(); res.once('close', onClose);
-    let jobId = null, status = null, selected = null, unlockKey = null;
+    let jobId = null, status = null, selected = null, unlockKey = null, msgpack = false;
     try {
-      const raw = await readBody(req, MAX_BODY), type = req.headers['content-type'] ?? '';
-      let body, payload = raw;
-      if (path === '/ai/upscale' && type.startsWith('multipart/form-data')) {
-        const form = await new Response(raw, { headers: { 'Content-Type': type } }).formData();
-        const image = form.get('image'), request = form.get('request');
-        assert(image instanceof Blob && image.size > 0 && request instanceof Blob, '放大请求缺少图片或参数');
-        body = parse(Buffer.from(await request.arrayBuffer()));
-        assert(body.image === 'image' && body.model === 'nai-diffusion-5-curated', '放大参数无效');
-        Object.assign(body, imageSize(Buffer.from(await image.arrayBuffer())));
+      const raw = await readBody(req, MAX_BODY);
+      let type = req.headers['content-type'] ?? '';
+      const mediaType = type.split(';')[0].trim().toLowerCase(), streaming = path.endsWith('-stream');
+      let body, form = null, payload = raw;
+      if (mediaType === 'multipart/form-data') {
+        ({ form, body } = await parseMultipart(raw, type));
+        if (path === '/ai/generate-image' || streaming) validateGenerationParts(form, body);
+        else {
+          const image = imagePart(form, body.image);
+          if (path === '/ai/upscale') {
+            assert(body.image === 'image' && body.model === 'nai-diffusion-5-curated', '放大参数无效');
+            Object.assign(body, imageSize(Buffer.from(await image.arrayBuffer())));
+          }
+          if (path === '/ai/augment-image') {
+            const size = imageSize(Buffer.from(await image.arrayBuffer()));
+            assert(body.width === size.width && body.height === size.height, '声明尺寸与实际图片尺寸不符');
+          }
+        }
       } else {
-        assert(type.startsWith('application/json'), '需要 JSON 或受支持的放大表单', 415);
+        assert(mediaType === 'application/json', '需要 JSON 或受支持的图片表单', 415);
         body = parse(raw);
         if (path === '/ai/upscale') {
           assert(body.model === 'nai-diffusion-5-curated', '放大参数无效');
@@ -336,6 +346,12 @@ export function createApp(config) {
       unlockKey = await router.lockKey(key.id, waiting.signal);
       // Validate the complete body before querying or occupying any upstream account.
       reservation(path, body, billingAccount(store.usableKey(key.id)));
+      if (streaming) {
+        msgpack = body.parameters.stream === 'msgpack';
+        body.parameters.stream = 'sse';
+        if (form) ({ payload, type } = await replaceMultipartRequest(form, body));
+        else payload = Buffer.from(JSON.stringify(body));
+      }
       const idempotency = req.headers['idempotency-key'] ?? null;
       assert(idempotency === null || typeof idempotency === 'string' && idempotency.length <= 128 && /^[\w-]+$/.test(idempotency), 'Idempotency-Key 格式无效');
       if (idempotency) assert(!store.db.prepare('SELECT id FROM jobs WHERE key_id=? AND idempotency=?').get(key.id, idempotency), '该请求已受理，请勿重复提交', 409);
@@ -348,8 +364,6 @@ export function createApp(config) {
       jobId = id;
       res.setHeader('X-Request-Id', id);
       if (mode !== 'nai5-bound') router.commit(selected.id, selected.pool);
-      const streaming = path.endsWith('-stream');
-      if (streaming) { body.parameters.stream = 'sse'; payload = Buffer.from(JSON.stringify(body)); }
       const response = await upstream.request(path, token, { method: 'POST', headers: { 'Content-Type': type, Accept: streaming ? 'text/event-stream' : req.headers.accept ?? 'application/zip, application/json' }, body: payload });
       status = response.status;
       if (!response.ok) {
@@ -368,19 +382,24 @@ export function createApp(config) {
       const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
       if (streaming) {
         assert(contentType.includes('text/event-stream'), '上游未返回预期 SSE 流', 502);
-        const check = new StreamCheck(body.parameters.n_samples);
-        if (!res.destroyed) { res.writeHead(status, { 'Content-Type': contentType, 'X-Accel-Buffering': 'no' }); res.flushHeaders(); }
+        const frames = [], check = new StreamCheck(body.parameters.n_samples, msgpack ? event => frames.push(encodeStreamEvent(event)) : null);
+        if (!res.destroyed) { res.writeHead(status, { 'Content-Type': msgpack ? 'application/x-msgpack' : contentType, 'X-Accel-Buffering': 'no' }); res.flushHeaders(); }
+        const forward = async chunk => {
+          if (!res.destroyed && !res.write(chunk)) await new Promise(resolve => {
+            const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+            res.once('drain', done); res.once('close', done);
+          });
+        };
         let size = 0;
         for await (const chunk of response.body) {
           size += chunk.length; assert(size <= 256 * 1024 * 1024, '生成结果过大', 502);
           check.feed(chunk);
           // A disconnected client cannot avoid the locally priced charge for a completed generation.
-          if (!res.destroyed && !res.write(chunk)) await new Promise(resolve => {
-            const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-            res.once('drain', done); res.once('close', done);
-          });
+          if (msgpack) { for (const frame of frames.splice(0)) await forward(frame); }
+          else await forward(chunk);
         }
         complete = check.complete();
+        for (const frame of frames.splice(0)) await forward(frame);
       } else {
         result = await readBounded(response);
         complete = result.length > 0;
@@ -396,8 +415,9 @@ export function createApp(config) {
       }
     } catch (error) {
       if (jobId) store.fail(jobId, '请求超时、中断或结果不完整，任务失败，已释放预留点数', status);
-      if (res.headersSent && !res.destroyed && String(res.getHeader('Content-Type')).includes('text/event-stream')) {
-        res.end(`event: error\ndata: ${JSON.stringify({ event_type: 'error', error: '生成失败，未扣点数', requestId: jobId })}\n\n`);
+      if (res.headersSent && !res.destroyed && (msgpack || String(res.getHeader('Content-Type')).includes('text/event-stream'))) {
+        const event = { event_type: 'error', error: '生成失败，未扣点数', requestId: jobId };
+        res.end(msgpack ? encodeStreamEvent(event) : `event: error\ndata: ${JSON.stringify(event)}\n\n`);
         return;
       }
       throw error;

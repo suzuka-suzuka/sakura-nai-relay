@@ -4,7 +4,7 @@ export const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42m
 export async function mockUpstream() {
   const state = { balance: 10000, paid: true, fail: false, incomplete: false, cost: 26, calls: [], slow: 0, queryFails: false, deltaOverride: null, accounts: new Map(), failBalanceDelta: 0 };
   const server = createServer(async (req, res) => {
-    const call = { path: req.url, auth: req.headers.authorization }; state.calls.push(call);
+    const call = { path: req.url, auth: req.headers.authorization, contentType: req.headers['content-type'] }; state.calls.push(call);
     const account = state.accounts.get(req.headers.authorization?.replace('Bearer ', '')) ?? state;
     if (req.url === '/user/subscription') {
       if (account.querySlow) await delay(account.querySlow);
@@ -14,7 +14,18 @@ export async function mockUpstream() {
     }
     if (req.url.startsWith('/ai/generate-image/suggest-tags')) { res.setHeader('Content-Type', 'application/json'); return res.end('{"tags":[{"tag":"cherry blossoms"}]}'); }
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
-    let body = {}; try { body = JSON.parse(Buffer.concat(chunks)); } catch {}
+    const raw = Buffer.concat(chunks);
+    let body = {};
+    try {
+      if (call.contentType?.startsWith('multipart/form-data')) {
+        const form = await new Response(raw, { headers: { 'Content-Type': call.contentType } }).formData();
+        const request = form.get('request');
+        body = JSON.parse(request instanceof Blob ? await request.text() : request);
+        call.parts = {};
+        for (const [name, value] of form) if (name !== 'request' && value instanceof Blob) call.parts[name] = Buffer.from(await value.arrayBuffer());
+        call.raw = raw;
+      } else body = JSON.parse(raw);
+    } catch {}
     call.body = body;
     if (account.connectionFails) { res.destroy(); return; }
     account.activeGenerations = (account.activeGenerations ?? 0) + 1;
@@ -26,6 +37,10 @@ export async function mockUpstream() {
     account.onGenerate?.(body);
     if (req.url.endsWith('-stream')) {
       res.setHeader('Content-Type', 'text/event-stream');
+      if (account.streamChunks) {
+        for (const chunk of account.streamChunks) { res.write(chunk); await delay(1); }
+        return res.end();
+      }
       res.write('event: intermediate\ndata: {"event_type":"intermediate","samp_ix":0,"step_ix":1,"image":"'+image+'"}\n\n');
       if (!account.incomplete) for (let i=0; i<Math.min(account.finalCount ?? Infinity, body.parameters?.n_samples ?? 1); i++) res.write(`event: final\ndata: ${JSON.stringify({ event_type: 'final', samp_ix: i, step_ix: 23, image })}\n\n`);
       return res.end();

@@ -4,6 +4,12 @@
 
 运行环境：Node.js **22.18+**，建议 Node.js 24。使用原生 HTTP、SQLite 和加密模块，无第三方运行依赖，无需前端构建。
 
+兼容 [Aaalice NAI Launcher](https://github.com/Aaalice233/Aaalice_NAI_Launcher) 使用的 `multipart/form-data` 请求：生成、图生图、重绘、Vibe 编码、图像处理和放大均可通过 `request` JSON 分块与二进制图片分块提交。生成参考图的 `reference_image_multiple_cached`、`director_reference_images_cached` 按实际条目数纳入本地计费和模型限制校验，重复引用同一图片分块不会减少参考图费用。
+
+流式生成按客户端的 `parameters.stream` 返回：`msgpack` 返回带 4 字节大端长度前缀的 MessagePack 帧，其他请求返回 SSE。服务仍向上游请求 SSE 并检查完整结果，再转换 Launcher 所需的预览与最终图片事件；不完整流或错误事件会释放预留并返回对应格式的失败事件。
+
+若 Launcher 显示 HTTP 415「需要 JSON 或受支持的放大表单」，说明运行中的中转仍使用仅支持 JSON 生成的旧代码。更新中转代码并重启服务；Docker 部署执行 `docker compose up -d --build`。只关闭实时预览不能解决旧服务拒绝普通 multipart 生成的问题。
+
 ## 下游等级
 
 | 行为 | 普通 Key（standard） | 会员 Key（member） |
@@ -174,6 +180,8 @@ src/server.mjs      管理 API、跨域、路由与转发
 src/db.mjs          SQLite、等级/绑定/有效期、点数预留与流水
 src/security.mjs    密码、会话与上游密钥加密
 src/billing.mjs     请求计价校验、额度字段与流式完整性检查
+src/multipart.mjs   request 参数与图片分块校验、流式参数重写
+src/msgpack.mjs     SSE 事件转换为 Launcher 的 MessagePack 帧
 src/cost.mjs        从前端搬来的 Anlas 计算逻辑
 src/image-size.mjs  读取实际图片尺寸，校验图片处理计价
 src/router.mjs      多上游空闲优先、最短队列、轮询与串行调度
