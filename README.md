@@ -74,6 +74,8 @@
 
 普通 Key 的 `/user/subscription` 完全在本地返回：tier=1、NAI5 usage 为零、余额为自己的余额减预留，不需要查询上游。会员返回 tier=3 和绑定上游的真实有效 usage。两种等级的 active/expiresAt 都按下游有效期处理，不使用上游到期时间；永久 Key 不返回 expiresAt。
 
+兼容 [Langbai NovelAI Studio](https://github.com/2786886095/novelai-image-desktop) 的 `GET /user/data` Token 验证和账号刷新：使用相同的 `Authorization: Bearer skr_...` 鉴权，返回 `{ "subscription": 下游订阅对象 }`。套餐、可用 Anlas 和到期时间与 `/user/subscription` 一致；会员额外保留绑定上游提供的有效 `usage.timeUntilNextPercent` 恢复时间，不伪造缺失值，不返回上游账号资料或密钥。客户端的 Image Endpoint 填写中转根地址，并开启允许向非官方 Endpoint 发送 Token。更新中转后需重启服务；Docker 部署执行 `docker compose up -d --build`。
+
 `relay` 包含等级、到期时间（毫秒）、余额、预留、可用余额、绑定上游 ID 和体力来源。官方兼容字段 expiresAt 使用秒。后台上游额度查询仍显示真实套餐、到期时间、Anlas 与 NAI5 体力，不使用下游等级。
 
 - 创建 Key 可选永久、从创建起若干天、指定日期时间。

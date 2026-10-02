@@ -21,7 +21,7 @@ async function readBody(req, max) {
   for await (const chunk of req) { size += chunk.length; assert(size <= max, '请求内容过大', 413); chunks.push(chunk); }
   return Buffer.concat(chunks);
 }
-const label = (value, max = 64) => { assert(typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max, `请输入 1–${max} 字的名称或备注`); return value.trim(); };
+const optionalNote = (value = '') => { assert(typeof value === 'string' && value.trim().length <= 160, '备注应为不超过 160 字的文本'); return value.trim(); };
 const optionalName = value => { assert(typeof value === 'string' && value.trim().length <= 64, '名称应为不超过 64 字的文本'); return value.trim(); };
 const cookieToken = (req) => req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('sakura_session='))?.slice(15);
 
@@ -201,7 +201,7 @@ export function createApp(config) {
     if (keyMatch && req.method === 'POST') {
       const id = Number(keyMatch[1]), body = parse(await readBody(req, 4096));
       assert(store.key(id), '密钥不存在', 404);
-      if (keyMatch[2]) store.adjust(id, integer(body.delta, -1_000_000_000, 1_000_000_000), label(body.note, 160));
+      if (keyMatch[2]) store.adjust(id, integer(body.delta, -1_000_000_000, 1_000_000_000), optionalNote(body.note));
       else {
         if (body.name !== undefined) body.name = optionalName(body.name);
         if (body.tier !== undefined || body.upstreamId !== undefined)
@@ -444,7 +444,8 @@ export function createApp(config) {
     try {
       const url = new URL(req.url, config.publicOrigin), path = url.pathname;
       if (path.startsWith('/admin/api/')) return await admin(req, res, path);
-      const relayRoute = path === '/user/subscription' || path === '/ai/generate-image/suggest-tags' || PAID.has(path);
+      const accountRoute = path === '/user/subscription' || path === '/user/data';
+      const relayRoute = accountRoute || path === '/ai/generate-image/suggest-tags' || PAID.has(path);
       if (relayRoute) {
         const origin = req.headers.origin;
         if (origin) {
@@ -461,11 +462,17 @@ export function createApp(config) {
         const key = token && store.authenticate(token); assert(key, '中转密钥无效或已停用', 401);
         assert(options().enabled, '中转已暂停', 503);
         if (PAID.has(path)) return await paid(req, res, path, key);
-        if (path === '/user/subscription') {
+        if (accountRoute) {
           const data = key.tier === 'member' ? await upstream.subscription(store.upstreamToken(key.nai5_upstream_id)) : null;
           const current = store.usableKey(key.id);
           assert(current.tier === key.tier && current.nai5_upstream_id === key.nai5_upstream_id, '密钥等级或绑定已变化，请重新查询订阅', 409);
-          return json(res, 200, downstreamSubscription(current, data));
+          const subscription = downstreamSubscription(current, data);
+          if (path === '/user/data') {
+            const recoveryTime = data?.usage?.timeUntilNextPercent;
+            if (Number.isFinite(recoveryTime) && recoveryTime >= 0) subscription.usage.timeUntilNextPercent = recoveryTime;
+            return json(res, 200, { subscription });
+          }
+          return json(res, 200, subscription);
         }
         const selected = router.pick(), upstreamToken = store.upstreamToken(selected.id);
         assert(url.search.length < 4096, '标签查询过长');

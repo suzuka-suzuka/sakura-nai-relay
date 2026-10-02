@@ -11,7 +11,7 @@ export async function mockUpstream() {
       if (account.querySlow) await delay(account.querySlow);
       if (account.queryFails) { res.writeHead(503); return res.end('{}'); }
       res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify({ tier: account.tier ?? 3, active: account.active ?? true, expiresAt: account.expiresAt ?? Date.now() / 1000 + 86400, trainingStepsLeft: { fixedTrainingStepsLeft: account.balance, purchasedTrainingSteps: 0 }, usage: { percent: account.usagePercent ?? (account.paid ? 0 : 73.6), isNegative: account.usageNegative ?? account.paid }, email: 'private@example.com', token: 'SHOULD_NOT_LEAK' }));
+      return res.end(JSON.stringify({ tier: account.tier ?? 3, active: account.active ?? true, expiresAt: account.expiresAt ?? Date.now() / 1000 + 86400, trainingStepsLeft: { fixedTrainingStepsLeft: account.balance, purchasedTrainingSteps: 0 }, usage: { percent: account.usagePercent ?? (account.paid ? 0 : 73.6), isNegative: account.usageNegative ?? account.paid, timeUntilNextPercent: account.timeUntilNextPercent }, email: 'private@example.com', token: 'SHOULD_NOT_LEAK' }));
     }
     if (req.url.startsWith('/ai/generate-image/suggest-tags')) { res.setHeader('Content-Type', 'application/json'); return res.end('{"tags":[{"tag":"cherry blossoms"}]}'); }
     const chunks = []; for await (const chunk of req) chunks.push(chunk);

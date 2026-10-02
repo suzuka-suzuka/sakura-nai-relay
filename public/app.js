@@ -223,7 +223,7 @@ function createKey() {
 }
 function points(id) {
   const k = state.data.keys.find(k => k.id === Number(id)); if (!k) return;
-  modal('调整 Anlas', `<form id="points-form" data-id="${k.id}"><div class="balance-summary"><span>${e(k.name)}<small>当前余额 / 预留 ${number(k.reserved)} Anlas</small></span><strong>${number(k.balance)}</strong></div><label>调整数量<div class="input-unit"><input name="delta" type="number" step="1" min="-1000000000" max="1000000000" placeholder="1000" required autofocus><span>Anlas</span></div></label><p class="field-note">正数增加，负数扣减；不能扣减已预留的 Anlas。</p><label>备注<input name="note" maxlength="160" placeholder="例如：补充创作额度" required></label><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">确认调整</button></div></form>`);
+  modal('调整 Anlas', `<form id="points-form" data-id="${k.id}"><div class="balance-summary"><span>${e(k.name)}<small>当前余额 / 预留 ${number(k.reserved)} Anlas</small></span><strong>${number(k.balance)}</strong></div><label>调整数量<div class="input-unit"><input name="delta" type="number" step="1" min="-1000000000" max="1000000000" placeholder="1000" required autofocus><span>Anlas</span></div></label><p class="field-note">正数增加，负数扣减；不能扣减已预留的 Anlas。</p><label>备注（可选）<input name="note" maxlength="160"></label><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">确认调整</button></div></form>`);
 }
 async function detail(id) {
   const k = state.data.keys.find(k => k.id === Number(id)); if (!k) return;

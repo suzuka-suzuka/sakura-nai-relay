@@ -208,6 +208,78 @@ test('普通订阅由本地返回；会员返回绑定上游体力与自身余�
   assert.equal(quota.upstreams[0].account.relay.balance,10000);
 });
 
+test('user/data 普通账号可解析下游套餐、可用余额和有效期，上游故障不影响查询', async t => {
+  const f = await fixture(t), expiresAt = Date.now() + 7 * 86400000;
+  f.app.store.updateKey(f.key.id, { expiresAt });
+  f.app.store.reserve(f.key.id, 'account-query-reservation', '/ai/generate-image', 'nai-diffusion-5-full', 26, null, 1);
+  f.mock.state.queryFails = true; f.mock.state.calls = [];
+  const before = { key: f.app.store.key(f.key.id), jobs: f.app.store.jobs(), ledger: f.app.store.ledger() };
+  const response = await f.relay('/user/data'); assert.equal(response.status, 200);
+  const data = await response.json(), subscription = data.subscription;
+  assert.deepEqual(data, { subscription: await (await f.relay('/user/subscription')).json() });
+  assert.equal(subscription.tier, 1); assert.equal(subscription.active, true);
+  assert.deepEqual(subscription.trainingStepsLeft, { fixedTrainingStepsLeft: 74, purchasedTrainingSteps: 0 });
+  assert.equal(subscription.expiresAt, expiresAt / 1000); assert.equal(subscription.relay.expiresAt, expiresAt);
+  assert.deepEqual(subscription.usage, { percent: 0, isNegative: true });
+  assert.equal(f.mock.state.calls.length, 0);
+  assert.deepEqual({ key: f.app.store.key(f.key.id), jobs: f.app.store.jobs(), ledger: f.app.store.ledger() }, before);
+  f.app.store.fail('account-query-reservation', '测试结束');
+  f.app.store.updateKey(f.key.id, { expiresAt: null });
+  assert.equal((await (await f.relay('/user/data')).json()).subscription.expiresAt, undefined);
+});
+
+test('user/data 会员返回下游余额和绑定体力恢复时间，不泄露上游资料', async t => {
+  const f = await fixture(t), expiresAt = Date.now() + 7 * 86400000;
+  await member(f); f.app.store.updateKey(f.key.id, { expiresAt });
+  f.mock.state.paid = false; f.mock.state.timeUntilNextPercent = 19.5; f.mock.state.calls = [];
+  const response = await f.relay('/user/data'); assert.equal(response.status, 200);
+  const data = await response.json(), subscription = data.subscription;
+  assert.deepEqual(Object.keys(data), ['subscription']);
+  assert.equal(subscription.tier, 3); assert.equal(subscription.active, true);
+  assert.deepEqual(subscription.trainingStepsLeft, { fixedTrainingStepsLeft: 100, purchasedTrainingSteps: 0 });
+  assert.equal(subscription.expiresAt, expiresAt / 1000);
+  assert.deepEqual(subscription.usage, { percent: 73.6, isNegative: false, timeUntilNextPercent: 19.5 });
+  assert.equal(subscription.relay.nai5UpstreamId, 1);
+  for (const secret of ['private@example.com', 'SHOULD_NOT_LEAK', 'pst-local-test', f.key.token])
+    assert.ok(!JSON.stringify(data).includes(secret));
+  assert.deepEqual(f.mock.state.calls.map(call => call.path), ['/user/subscription']);
+  const original = await (await f.relay('/user/subscription')).json();
+  assert.deepEqual(original.usage, { percent: 73.6, isNegative: false });
+  for (const recoveryTime of [undefined, null, -1, '19.5']) {
+    f.mock.state.timeUntilNextPercent = recoveryTime;
+    assert.equal((await (await f.relay('/user/data')).json()).subscription.usage.timeUntilNextPercent, undefined);
+  }
+  f.mock.state.timeUntilNextPercent = 0; f.mock.state.usagePercent = 0;
+  assert.deepEqual((await (await f.relay('/user/data')).json()).subscription.usage,
+    { percent: 0, isNegative: true, timeUntilNextPercent: 0 });
+  f.mock.state.queryFails = true;
+  assert.equal((await f.relay('/user/data')).status, 502);
+  assert.equal(f.app.store.key(f.key.id).balance, 100); assert.equal(f.app.store.jobs().length, 0);
+});
+
+test('user/data 保留鉴权、有效期、暂停状态和跨域校验，只接受 GET', async t => {
+  const f = await fixture(t); f.mock.state.calls = [];
+  for (const headers of [{}, { Authorization: 'Bearer skr_' + 'x'.repeat(43) }])
+    assert.equal((await fetch(f.base + '/user/data', { headers })).status, 401);
+  const website = 'http://127.0.0.1:3000';
+  const pre = await fetch(f.base + '/user/data', { method: 'OPTIONS', headers: {
+    Origin: website, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization',
+  } });
+  assert.equal(pre.status, 204); assert.equal(pre.headers.get('access-control-allow-origin'), website);
+  const allowed = await f.relay('/user/data', undefined, { Origin: website });
+  assert.equal(allowed.status, 200); assert.equal(allowed.headers.get('access-control-allow-origin'), website);
+  assert.equal((await f.relay('/user/data', undefined, { Origin: 'https://evil.example' })).status, 403);
+  assert.equal((await f.relay('/user/data', {})).status, 405);
+  f.app.store.updateKey(f.key.id, { enabled: false });
+  assert.equal((await f.relay('/user/data')).status, 401);
+  f.app.store.updateKey(f.key.id, { enabled: true, expiresAt: Date.now() - 1 });
+  const expired = await f.relay('/user/data'); assert.equal(expired.status, 403);
+  assert.equal((await expired.json()).code, 'KEY_EXPIRED');
+  f.app.store.updateKey(f.key.id, { expiresAt: null }); f.app.store.set('enabled', 'false');
+  assert.equal((await f.relay('/user/data')).status, 503);
+  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+});
+
 test('完整密钥可重复查看，仅管理员通过 Origin 和 CSRF 校验后可读取', async t => {
   const f = await fixture(t), path = `/admin/api/keys/${f.key.id}/reveal`;
   assert.equal((await fetch(f.base + path, { method:'POST', headers:{Origin:origin}, body:'{}' })).status,401);
@@ -427,7 +499,7 @@ test('CORS 预检、非法来源与未经许可的接口', async t => {
   const pre = await fetch(f.base+'/ai/generate-image',{method:'OPTIONS',headers:{Origin:'http://127.0.0.1:3000','Access-Control-Request-Headers':'authorization, content-type'}});
   assert.equal(pre.status,204); assert.equal(pre.headers.get('access-control-allow-origin'),'http://127.0.0.1:3000');
   assert.equal((await f.relay('/user/subscription',undefined,{Origin:'https://evil.example'})).status,403);
-  assert.equal((await f.relay('/user/data')).status,404);
+  assert.equal((await f.relay('/user/unknown')).status,404);
   assert.equal((await f.relay('/ai/generate',payload())).status,404);
 });
 
