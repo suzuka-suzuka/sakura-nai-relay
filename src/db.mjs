@@ -86,8 +86,9 @@ export class Store {
   upstreamToken(id = this.upstreams()[0]?.id) { const row = this.upstream(id ?? -1); return row ? unseal(row.token, this.master) : null; }
   addUpstream({ name, token, enabled = true }) {
     const existing = this.db.prepare('SELECT id,retired_at FROM upstreams WHERE token_hash=?').get(hash(token));
+    if (existing) assert(existing.retired_at, '这个上游 Key 已存在，请编辑原有记录', 409);
+    name = this.recordName(name ?? '', 'upstreams');
     if (existing) {
-      assert(existing.retired_at, '这个上游 Key 已存在，请编辑原有记录', 409);
       this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=? WHERE id=?').run(name, Number(enabled), existing.id);
       return existing.id;
     }
@@ -100,7 +101,7 @@ export class Store {
       assert(!this.db.prepare('SELECT id FROM upstreams WHERE token_hash=? AND id!=?').get(hash(token), id), '这个上游 Key 已存在', 409);
       this.db.prepare('UPDATE upstreams SET token=?,token_hash=?,suffix=? WHERE id=?').run(seal(token, this.master), hash(token), token.slice(-4), id);
     }
-    this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name, Number(enabled), id);
+    this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), id);
   }
   boundKeys(id) { return this.db.prepare('SELECT id,reserved FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL').all(id); }
   retireUpstream(id, replacementId = null) {
@@ -141,6 +142,22 @@ export class Store {
     const key = this.key(id); assert(key, '密钥不存在', 404);
     return { id: key.id, token: unseal(key.token_encrypted, this.master) };
   }
+  searchKeys(query) {
+    const text = query.toLowerCase();
+    return this.db.prepare('SELECT id,name,prefix,token_encrypted FROM keys WHERE retired_at IS NULL ORDER BY id DESC').all()
+      .filter(key => key.name.toLowerCase().includes(text) || key.prefix.toLowerCase().includes(text) || unseal(key.token_encrypted, this.master).includes(query))
+      .map(key => key.id);
+  }
+  recordName(name, table) {
+    if (name.trim()) return name.trim();
+    const setting = table === 'keys' ? 'key_name_sequence' : 'upstream_name_sequence';
+    const prefix = table === 'keys' ? '下游-Key-' : '上游-Key-';
+    let sequence = Number(this.get(setting) ?? 0);
+    const occupied = this.db.prepare(`SELECT id FROM ${table} WHERE lower(name)=? LIMIT 1`);
+    do { sequence++; } while (occupied.get(`${prefix}${sequence}`.toLowerCase()));
+    this.set(setting, String(sequence));
+    return `${prefix}${sequence}`;
+  }
   keySettings(options, previous = {}) {
     const tier = options.tier ?? previous.tier ?? 'standard';
     assert(['standard', 'member'].includes(tier), '等级只能是普通或会员');
@@ -159,6 +176,7 @@ export class Store {
     const token = `skr_${random()}`;
     return this.transaction(() => {
       const { tier, binding, expires } = this.keySettings(options);
+      name = this.recordName(name ?? '', 'keys');
       const result = this.db.prepare('INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,nai5_upstream_id,expires_at) VALUES(?,?,?,?,?,?,?,?,?)').run(name, hash(token), `${token.slice(0, 10)}…${token.slice(-4)}`, balance, Date.now(), seal(token, this.master), tier, binding, expires);
       const id = Number(result.lastInsertRowid);
       this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
@@ -171,7 +189,7 @@ export class Store {
       const { tier, binding, expires } = this.keySettings(options, key);
       assert(options.enabled === undefined || typeof options.enabled === 'boolean', '状态无效');
       this.db.prepare('UPDATE keys SET name=?,tier=?,nai5_upstream_id=?,expires_at=?,enabled=? WHERE id=?')
-        .run(options.name ?? key.name, tier, binding, expires, options.enabled === undefined ? key.enabled : Number(options.enabled), id);
+        .run(options.name === undefined ? key.name : this.recordName(options.name, 'keys'), tier, binding, expires, options.enabled === undefined ? key.enabled : Number(options.enabled), id);
     });
   }
   retireKey(id) {

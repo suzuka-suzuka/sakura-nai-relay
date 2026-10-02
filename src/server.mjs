@@ -22,6 +22,7 @@ async function readBody(req, max) {
   return Buffer.concat(chunks);
 }
 const label = (value, max = 64) => { assert(typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max, `请输入 1–${max} 字的名称或备注`); return value.trim(); };
+const optionalName = value => { assert(typeof value === 'string' && value.trim().length <= 64, '名称应为不超过 64 字的文本'); return value.trim(); };
 const cookieToken = (req) => req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('sakura_session='))?.slice(15);
 
 export function createApp(config) {
@@ -139,7 +140,7 @@ export function createApp(config) {
           return json(res, 200, { ok: true, reboundKeys, upstreamId });
         }
         const body = parse(await readBody(req, 16384));
-        const name = label(body.name);
+        const name = optionalName(body.name === undefined ? previous?.name ?? '' : body.name);
         assert(typeof body.enabled === 'boolean', '状态无效');
         const token = typeof body.token === 'string' ? body.token.trim() : '';
         assert(id !== null || token, '请填写官方 Key');
@@ -173,9 +174,14 @@ export function createApp(config) {
       });
       return json(res, 200, { ok: true });
     }
+    if (path === '/admin/api/keys/search' && req.method === 'POST') {
+      const body = parse(await readBody(req, 4096));
+      assert(typeof body.query === 'string' && body.query.trim().length <= 256, '搜索内容应为不超过 256 字的文本');
+      return json(res, 200, { ids: store.searchKeys(body.query.trim()) });
+    }
     if (path === '/admin/api/keys' && req.method === 'POST') {
       const body = parse(await readBody(req, 4096));
-      const name = label(body.name), points = integer(body.points, 0, 1_000_000_000);
+      const name = optionalName(body.name === undefined ? '' : body.name), points = integer(body.points, 0, 1_000_000_000);
       if (body.tier === 'member') body.upstreamId = await autoBindMember();
       return json(res, 201, store.createKey(name, points, body));
     }
@@ -197,7 +203,7 @@ export function createApp(config) {
       assert(store.key(id), '密钥不存在', 404);
       if (keyMatch[2]) store.adjust(id, integer(body.delta, -1_000_000_000, 1_000_000_000), label(body.note, 160));
       else {
-        if (body.name !== undefined) body.name = label(body.name);
+        if (body.name !== undefined) body.name = optionalName(body.name);
         if (body.tier !== undefined || body.upstreamId !== undefined)
           assert(!router.keyQueue.size(id), '请等待该密钥的生成和排队结束，再修改等级或绑定', 409);
         store.updateKey(id, body);

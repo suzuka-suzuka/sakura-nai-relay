@@ -318,6 +318,81 @@ test('尚未预留的排队请求和零点数进行中任务也会阻止删除',
   assert.equal(f.app.store.jobs()[0].charged, 0);
 });
 
+test('名称省略、留空或仅含空白时自动递增命名，会员可用零点数创建 30 天密钥', async t => {
+  const f = await fixture(t); f.mock.state.paid = false;
+  for (const [index, extra] of [{}, { name: '' }, { name: '  \t ' }].entries()) {
+    const before = Date.now(), res = await f.call('/admin/api/keys', 'POST', { ...extra, points: 0, tier: 'member', validDays: 30 });
+    assert.equal(res.status, 201);
+    const created = await res.json(), key = f.app.store.key(created.id);
+    assert.equal(key.name, `下游-Key-${index + 1}`); assert.equal(key.tier, 'member');
+    assert.equal(key.balance, 0); assert.equal(key.nai5_upstream_id, 1);
+    assert.ok(key.expires_at >= before + 30 * 86400000 && key.expires_at <= Date.now() + 30 * 86400000);
+  }
+  assert.equal((await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { name: '  ' })).status, 200);
+  assert.equal(f.app.store.key(f.key.id).name, '下游-Key-4');
+  await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { enabled: false });
+  assert.equal(f.app.store.key(f.key.id).name, '下游-Key-4');
+  for (const name of [null, 123, 'x'.repeat(65)]) {
+    assert.equal((await f.call('/admin/api/keys', 'POST', { name, points: 0 })).status, 400);
+    assert.equal((await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { name })).status, 400);
+  }
+});
+
+test('上游名称可省略或留空，跳过占用编号、删除后不复用且与下游分别计数', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.call('/admin/api/upstreams', 'POST', { name: '上游-KEY-1', token: 'pst-name-occupied', enabled: true })).status, 201);
+  let last;
+  for (const [index, extra] of [{}, { name: '' }, { name: '  \t ' }].entries()) {
+    const res = await f.call('/admin/api/upstreams', 'POST', { ...extra, token: `pst-auto-name-${index}`, enabled: true });
+    assert.equal(res.status, 201); last = (await res.json()).id;
+    assert.equal(f.app.store.upstream(last).name, `上游-Key-${index + 2}`);
+  }
+  const token = f.app.store.upstreamToken(last);
+  assert.equal((await f.call(`/admin/api/upstreams/${last}`, 'PUT', { name: '', token: '', enabled: false })).status, 200);
+  assert.equal(f.app.store.upstream(last).name, '上游-Key-5'); assert.equal(f.app.store.upstreamToken(last), token);
+  assert.equal((await f.call(`/admin/api/upstreams/${last}`, 'PUT', { token: '', enabled: true })).status, 200);
+  assert.equal(f.app.store.upstream(last).name, '上游-Key-5');
+  assert.equal((await f.call(`/admin/api/upstreams/${last}`, 'DELETE')).status, 200);
+  const next = await (await f.call('/admin/api/upstreams', 'POST', { name: '', token: 'pst-auto-name-next', enabled: true })).json();
+  assert.equal(f.app.store.upstream(next.id).name, '上游-Key-6');
+  const downstream = await (await f.call('/admin/api/keys', 'POST', { name: '', points: 0 })).json();
+  assert.equal(f.app.store.key(downstream.id).name, '下游-Key-1');
+  for (const name of [null, 123, 'x'.repeat(65)]) {
+    assert.equal((await f.call('/admin/api/upstreams', 'POST', { name, token: 'pst-invalid-name', enabled: true })).status, 400);
+    assert.equal((await f.call(`/admin/api/upstreams/${next.id}`, 'PUT', { name, token: '', enabled: true })).status, 400);
+  }
+});
+
+test('管理员可按完整密钥、隐藏片段或名称查询，响应只返回 ID 且保留过期和停用记录', async t => {
+  const f = await fixture(t);
+  const second = await (await f.call('/admin/api/keys', 'POST', { name: '  Alice  ', points: 0 })).json();
+  for (const query of [f.key.token, `  ${f.key.token}  `, f.key.token.slice(12, 28), '测试用户']) {
+    const res = await f.call('/admin/api/keys/search', 'POST', { query });
+    assert.equal(res.status, 200); assert.deepEqual(await res.json(), { ids: [f.key.id] });
+  }
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: 'ALICE' })).json(), { ids: [second.id] });
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: '' })).json(), { ids: [second.id, f.key.id] });
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: 'unknown-key' })).json(), { ids: [] });
+  await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { expiresAt: Date.now() - 1 });
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: f.key.token })).json(), { ids: [f.key.id] });
+  await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { enabled: false });
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: f.key.token })).json(), { ids: [f.key.id] });
+  const snapshot = await (await f.call('/admin/api/snapshot')).json();
+  assert.ok(!JSON.stringify(snapshot).includes(f.key.token));
+  await f.call(`/admin/api/keys/${f.key.id}`, 'DELETE');
+  assert.deepEqual(await (await f.call('/admin/api/keys/search', 'POST', { query: f.key.token })).json(), { ids: [] });
+});
+
+test('密钥搜索要求管理员登录、同源和 CSRF，并校验查询类型及长度', async t => {
+  const f = await fixture(t), path = '/admin/api/keys/search', body = JSON.stringify({ query: f.key.token });
+  const unauthenticated = await fetch(f.base + path, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body });
+  assert.equal(unauthenticated.status, 401);
+  assert.equal((await f.call(path, 'POST', { query: f.key.token }, { 'X-CSRF-Token': 'wrong' })).status, 403);
+  assert.equal((await f.call(path, 'POST', { query: f.key.token }, { Origin: 'https://other.test' })).status, 403);
+  for (const query of [null, 42, 'x'.repeat(257)]) assert.equal((await f.call(path, 'POST', { query })).status, 400);
+  assert.equal((await f.call(path, 'POST', {})).status, 400);
+});
+
 test('停用和过期密钥都可以删除', async t => {
   const f = await fixture(t);
   const expired = await (await f.call('/admin/api/keys', 'POST', { name: '过期密钥', points: 1, expiresAt: Date.now() - 1 })).json();
@@ -846,6 +921,10 @@ test('到期在鉴权时拒绝；续期保留余额；订阅返回下游到期�
   assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',{expiresAt:past})).status,200);
   const res=await f.relay('/user/subscription');assert.equal(res.status,403);assert.equal((await res.json()).code,'KEY_EXPIRED');
   assert.equal((await f.relay('/ai/generate-image',payload())).status,403);assert.equal(generatedCalls(f).length,0);
+  const expiredKey = (await (await f.call('/admin/api/snapshot')).json()).keys.find(key => key.id === f.key.id);
+  assert.equal(expiredKey.expires_at, past); assert.equal(expiredKey.balance, 100); assert.equal(expiredKey.enabled, 1);
+  assert.deepEqual(await (await f.call(`/admin/api/keys/${f.key.id}/reveal`, 'POST', {})).json(), f.key);
+  assert.equal(f.app.store.ledger().filter(row => row.key_id === f.key.id).length, 1);
   const before=Date.now();await f.call('/admin/api/keys/'+f.key.id,'POST',{validDays:7});
   const expires=f.app.store.key(f.key.id).expires_at;assert.ok(expires>=before+7*86400000);
   await f.call('/admin/api/keys/'+f.key.id,'POST',{validDays:3});

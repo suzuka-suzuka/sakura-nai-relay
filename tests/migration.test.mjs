@@ -7,6 +7,33 @@ import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/db.mjs';
 import { seal, hash } from '../src/security.mjs';
 
+test('自动名称跳过已占用编号，改名、删除和重启后仍继续递增，失败事务不消耗编号', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'sakura-schema-test-')); let store;
+  try {
+    store = new Store(directory);
+    store.addUpstream({ name: '上游-KEY-1', token: 'pst-name-occupied' });
+    const upstream = store.addUpstream({ name: '', token: 'pst-auto-name' });
+    assert.equal(store.upstream(upstream).name, '上游-Key-2');
+    store.retireUpstream(upstream);
+    store.createKey('下游-KEY-1', 0);
+    const first = store.createKey('', 0); assert.equal(store.key(first.id).name, '下游-Key-2');
+    store.updateKey(first.id, { name: '改名' });
+    const second = store.createKey(' ', 0); assert.equal(store.key(second.id).name, '下游-Key-3');
+    store.retireKey(second.id);
+    store.close(); store = new Store(directory);
+    const nextUpstream = store.addUpstream({ name: ' ', token: 'pst-auto-name-next' });
+    assert.equal(store.upstream(nextUpstream).name, '上游-Key-3');
+    const third = store.createKey('', 0); assert.equal(store.key(third.id).name, '下游-Key-4');
+    assert.throws(() => store.createKey('', -1));
+    const fourth = store.createKey('', 0); assert.equal(store.key(fourth.id).name, '下游-Key-5');
+    assert.deepEqual(store.searchKeys('key'), [fourth.id, third.id, 1]);
+  } finally {
+    store?.close();
+    assert.ok(resolve(directory).startsWith(resolve(tmpdir()) + '\\sakura-schema-test-') || resolve(directory).startsWith(resolve(tmpdir()) + '/sakura-schema-test-'));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('删除账号权重保留密钥、绑定和流水，原权重零转为停用且只迁移一次',()=>{
   const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-'));let store;
   try {

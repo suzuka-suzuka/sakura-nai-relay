@@ -19,7 +19,8 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', logs: 'jobs' };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, logs: 'jobs' };
+let keySearchTimer, keySearchVersion = 0;
 const titles = { overview: '运行概览', keys: '访问密钥', usage: '用量记录', settings: '上游设置' };
 
 function toast(message, bad = false) {
@@ -99,11 +100,11 @@ function keyForm(id) {
   const k = state.data.keys.find(row => row.id === Number(id));
   const dateValue = k?.expires_at ? new Date(k.expires_at - new Date(k.expires_at).getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
   modal(k ? '编辑访问密钥' : '创建访问密钥', `<form id="key-form" data-id="${k?.id ?? ''}">
-    <label>名称<input name="name" value="${e(k?.name ?? '')}" maxlength="64" required autofocus placeholder="例如：个人使用"></label>
-    <label>密钥等级<select name="tier" aria-label="密钥等级"><option value="standard" ${k?.tier !== 'member' ? 'selected' : ''}>普通 · 按点数使用</option><option value="member" ${k?.tier === 'member' ? 'selected' : ''}>会员 · Opus 计费权益</option></select></label>
+    <label>名称<input name="name" value="${e(k?.name ?? '')}" maxlength="64" autofocus></label>
+    <label>密钥等级<select name="tier" aria-label="密钥等级"><option value="standard" ${k?.tier === 'standard' ? 'selected' : ''}>普通 · 按点数使用</option><option value="member" ${!k || k.tier === 'member' ? 'selected' : ''}>会员 · Opus 计费权益</option></select></label>
     ${k ? `<div data-member-fields><label>NAI5 绑定上游<select name="upstreamId" aria-label="NAI5 绑定上游"><option value="">请选择上游</option>${state.data.upstreams.map(u => `<option value="${u.id}" ${k.nai5_upstream_id === u.id ? 'selected' : ''}>${e(u.name)}${!u.enabled ? '（已停用）' : ''}</option>`).join('')}</select></label></div>` : ''}
-    ${k ? '' : '<label>初始点数（Anlas）<input name="points" type="number" min="0" max="1000000000" step="1" value="1000" required></label>'}
-    <label>有效期<select name="expiryMode" aria-label="有效期">${k ? '<option value="keep">保持当前有效期</option>' : ''}<option value="never">永久有效</option><option value="days">${k ? '按天数续期' : '按天数设置'}</option><option value="date">指定到期时间</option></select></label>
+    ${k ? '' : '<label>初始点数（Anlas）<input name="points" type="number" min="0" max="1000000000" step="1" value="0" required></label>'}
+    <label>有效期<select name="expiryMode" aria-label="有效期">${k ? '<option value="keep" selected>保持当前有效期</option>' : ''}<option value="never">永久有效</option><option value="days" ${k ? '' : 'selected'}>${k ? '按天数续期' : '按天数设置'}</option><option value="date">指定到期时间</option></select></label>
     ${k ? `<p class="field-note">当前：${e(expiresText(k.expires_at))}</p>` : ''}
     <label data-expiry-days>有效天数<input name="validDays" type="number" min="1" max="36500" step="1" value="30"></label>
     <label data-expiry-date>到期时间（本地时区）<input name="expiresAt" type="datetime-local" value="${e(dateValue)}"></label>
@@ -135,7 +136,7 @@ function upstreamCards() {
 }
 function editUpstream(id) {
   const row = state.data.upstreams.find(u => u.id === Number(id));
-  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" placeholder="例如：樱花 · 主账户" maxlength="64" required autofocus></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
+  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" maxlength="64" autofocus></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
 }
 function usageChart(days, metric, title, unit) {
   const max = Math.max(1, ...days.map(day => day[metric] ?? 0));
@@ -164,6 +165,7 @@ function overview() {
   return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,hint,symbol], i) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}${i === 1 || i === 2 ? '<small>Anlas</small>' : ''}</strong>${hint ? `<p>${hint}</p>` : ""}</article>`).join('')}</div><div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div><div class="overview-grid"><section class="panel recent-panel"><div class="panel-title"><div><h2>最近创建的密钥</h2></div><a class="text-link" href="#keys">查看全部 ${icon('arrow')}</a></div>${keyTable(d.keys.slice(0, 4))}</section>${quotaPanel()}</div>`;
 }
 function keyTable(keys) {
+  if (!keys.length && state.filter.trim() && state.data.keys.length) return empty('没有匹配的密钥', '');
   if (!keys.length) return empty('暂无访问密钥', '', '<button class="button subtle" data-action="create">创建密钥</button>');
   return '<div class="table-scroll"><table><thead><tr><th>密钥 / 等级</th><th>状态 / 到期</th><th>可用点数</th><th>NAI5 上游</th><th class="right">管理</th></tr></thead><tbody>' + keys.map(k =>
     '<tr><td><div class="key-cell"><span class="key-avatar">'+icon('key')+'</span><div><strong>'+e(k.name)+'</strong><code>'+e(k.prefix)+'</code><small class="cell-note">'+tierName(k.tier)+'</small></div></div></td>'+
@@ -174,7 +176,20 @@ function keyTable(keys) {
   ).join('')+'</tbody></table></div>';
 }
 function keysView() { return `<div class="panel"><div class="panel-title"><div><h2>全部密钥 <span class="count">${state.data.keys.length}</span></h2></div><label class="search">${icon('search')}<input id="key-search" type="search" placeholder="搜索名称或密钥" value="${e(state.filter)}" aria-label="搜索密钥"></label></div><div id="key-table">${keyTable(filteredKeys())}</div></div>`; }
-function filteredKeys() { return state.data.keys.filter(k => `${k.name} ${k.prefix}`.toLowerCase().includes(state.filter.toLowerCase())); }
+function filteredKeys() {
+  const query = state.filter.trim().toLowerCase();
+  return state.data.keys.filter(k => !query || (state.keyMatches !== null ? state.keyMatches.includes(k.id) : `${k.name} ${k.prefix}`.toLowerCase().includes(query)));
+}
+async function searchKeys() {
+  const query = state.filter.trim(), version = ++keySearchVersion;
+  if (!query) { state.keyMatches = null; return; }
+  try {
+    const { ids } = await api('/keys/search', { method: 'POST', body: { query } });
+    if (version !== keySearchVersion || query !== state.filter.trim()) return;
+    state.keyMatches = ids;
+    const table = $('#key-table'); if (table) table.innerHTML = keyTable(filteredKeys());
+  } catch (error) { if (version === keySearchVersion) toast(error.message, true); }
+}
 function usageView() {
   const d = state.data;
   return `<div class="panel"><div class="panel-title"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div><span class="muted">最近 100 条</span></div>${state.logs === 'jobs' ? (d.jobs.length ? `<div class="table-scroll"><table><thead><tr><th>请求 / 时间</th><th>访问密钥 / 上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${d.jobs.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><small class="cell-note">${date(j.created_at)}</small></td><td>${e(j.key_name)}<small class="cell-note">${e(j.upstream_name || "旧记录")}</small></td><td><span class="model-name">${e(j.model)}</span><small class="cell-note">${e(j.endpoint.replace('/ai/', ''))}</small></td><td>${badge(j.status)}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty('暂无请求记录', '')) : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
@@ -183,8 +198,11 @@ function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
   return `<section class="pool-section"><div class="pool-heading"><h2>上游账户 <span class="count">${rows.length}</span></h2><button class="button primary" data-action="add-upstream">${icon('plus')}添加上游</button></div><div id="upstream-cards" class="upstream-cards">${upstreamCards()}</div></section><form class="panel settings-form" id="settings-form"><div class="panel-title"><h2>访问设置</h2><button class="button small subtle" type="button" data-action="password">修改密码</button></div><div class="access-fields"><div><label>允许的来源<textarea name="origins" rows="3" placeholder="* 或 https://example.com">${e(s.origins.join('\n'))}</textarea></label><p class="field-note">填写 * 允许所有来源；指定站点时每行一个，包含协议和端口，不含路径。访问仍需中转 Key。</p></div><div><label id="relay-address-label">中转地址</label><div class="address-field" aria-labelledby="relay-address-label"><code>${e(state.data.relayUrl)}</code><button class="icon-button" type="button" data-action="copy-url" aria-label="复制中转地址">${icon('copy')}</button></div><div class="toggle-row"><strong>开放中转</strong><label class="switch"><input name="enabled" type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="开放中转"><span></span></label></div></div></div><div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>`;
 }
-function renderView() { $('#view').innerHTML = ({ overview, keys: keysView, usage: usageView, settings: settingsView })[state.view](); }
-async function refresh() { state.data = await api('/snapshot'); shell(); }
+function renderView() {
+  $('#view').innerHTML = ({ overview, keys: keysView, usage: usageView, settings: settingsView })[state.view]();
+  if (state.view === 'keys' && state.filter.trim()) void searchKeys();
+}
+async function refresh() { state.data = await api('/snapshot'); state.keyMatches = null; shell(); }
 async function quota() {
   state.quotaError = '';
   try { state.quota = await api('/quota'); } catch (error) { state.quota = null; state.quotaError = error.message; }
@@ -254,7 +272,13 @@ document.addEventListener('click', async event => {
     if (action === 'logout') { await api('/logout', { method: 'POST', body: {} }); state.data = null; state.csrf = null; state.quota = null; await init(); }
   });
 });
-document.addEventListener('input', event => { if (event.target.id === 'key-search') { state.filter = event.target.value; $('#key-table').innerHTML = keyTable(filteredKeys()); } });
+document.addEventListener('input', event => {
+  if (event.target.id !== 'key-search') return;
+  clearTimeout(keySearchTimer); keySearchVersion++;
+  state.filter = event.target.value; state.keyMatches = null;
+  $('#key-table').innerHTML = keyTable(filteredKeys());
+  if (state.filter.trim()) keySearchTimer = setTimeout(searchKeys, 200);
+});
 document.addEventListener('change', event => { if (event.target.closest('#key-form')) syncKeyForm(); });
 document.addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target, button = $('button[type="submit"]', form), values = Object.fromEntries(new FormData(form));
