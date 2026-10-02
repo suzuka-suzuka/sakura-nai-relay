@@ -19,7 +19,7 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, logs: 'jobs' };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs' };
 let keySearchTimer, keySearchVersion = 0;
 const titles = { overview: '运行概览', keys: '访问密钥', usage: '用量记录', settings: '上游设置' };
 
@@ -165,7 +165,10 @@ function overview() {
   return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,hint,symbol], i) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}${i === 1 || i === 2 ? '<small>Anlas</small>' : ''}</strong>${hint ? `<p>${hint}</p>` : ""}</article>`).join('')}</div><div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div><div class="overview-grid"><section class="panel recent-panel"><div class="panel-title"><div><h2>最近创建的密钥</h2></div><a class="text-link" href="#keys">查看全部 ${icon('arrow')}</a></div>${keyTable(d.keys.slice(0, 4))}</section>${quotaPanel()}</div>`;
 }
 function keyTable(keys) {
-  if (!keys.length && state.filter.trim() && state.data.keys.length) return empty('没有匹配的密钥', '');
+  if (state.view === 'keys' && state.filter.trim()) {
+    if (state.keyMatches === null) return `<div role="${state.keySearchError ? 'alert' : 'status'}">${empty(state.keySearchError ? '搜索失败，请重试' : '正在搜索…', '')}</div>`;
+    if (!keys.length) return empty('没有匹配的密钥', '');
+  }
   if (!keys.length) return empty('暂无访问密钥', '', '<button class="button subtle" data-action="create">创建密钥</button>');
   return '<div class="table-scroll"><table><thead><tr><th>密钥 / 等级</th><th>状态 / 到期</th><th>可用点数</th><th>NAI5 上游</th><th class="right">管理</th></tr></thead><tbody>' + keys.map(k =>
     '<tr><td><div class="key-cell"><span class="key-avatar">'+icon('key')+'</span><div><strong>'+e(k.name)+'</strong><code>'+e(k.prefix)+'</code><small class="cell-note">'+tierName(k.tier)+'</small></div></div></td>'+
@@ -177,18 +180,23 @@ function keyTable(keys) {
 }
 function keysView() { return `<div class="panel"><div class="panel-title"><div><h2>全部密钥 <span class="count">${state.data.keys.length}</span></h2></div><label class="search">${icon('search')}<input id="key-search" type="search" placeholder="搜索名称或密钥" value="${e(state.filter)}" aria-label="搜索密钥"></label></div><div id="key-table">${keyTable(filteredKeys())}</div></div>`; }
 function filteredKeys() {
-  const query = state.filter.trim().toLowerCase();
-  return state.data.keys.filter(k => !query || (state.keyMatches !== null ? state.keyMatches.includes(k.id) : `${k.name} ${k.prefix}`.toLowerCase().includes(query)));
+  if (!state.filter.trim()) return state.data.keys;
+  return state.data.keys.filter(k => state.keyMatches?.includes(k.id));
 }
 async function searchKeys() {
   const query = state.filter.trim(), version = ++keySearchVersion;
-  if (!query) { state.keyMatches = null; return; }
+  if (!query) { state.keyMatches = null; state.keySearchError = ''; return; }
   try {
     const { ids } = await api('/keys/search', { method: 'POST', body: { query } });
     if (version !== keySearchVersion || query !== state.filter.trim()) return;
-    state.keyMatches = ids;
+    state.keyMatches = ids; state.keySearchError = '';
     const table = $('#key-table'); if (table) table.innerHTML = keyTable(filteredKeys());
-  } catch (error) { if (version === keySearchVersion) toast(error.message, true); }
+  } catch (error) {
+    if (version !== keySearchVersion || query !== state.filter.trim()) return;
+    state.keySearchError = error.message;
+    const table = $('#key-table'); if (table) table.innerHTML = keyTable(filteredKeys());
+    toast(error.message, true);
+  }
 }
 function usageView() {
   const d = state.data;
@@ -202,7 +210,7 @@ function renderView() {
   $('#view').innerHTML = ({ overview, keys: keysView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
 }
-async function refresh() { state.data = await api('/snapshot'); state.keyMatches = null; shell(); }
+async function refresh() { state.data = await api('/snapshot'); state.keyMatches = null; state.keySearchError = ''; shell(); }
 async function quota() {
   state.quotaError = '';
   try { state.quota = await api('/quota'); } catch (error) { state.quota = null; state.quotaError = error.message; }
@@ -275,7 +283,7 @@ document.addEventListener('click', async event => {
 document.addEventListener('input', event => {
   if (event.target.id !== 'key-search') return;
   clearTimeout(keySearchTimer); keySearchVersion++;
-  state.filter = event.target.value; state.keyMatches = null;
+  state.filter = event.target.value; state.keyMatches = null; state.keySearchError = '';
   $('#key-table').innerHTML = keyTable(filteredKeys());
   if (state.filter.trim()) keySearchTimer = setTimeout(searchKeys, 200);
 });
