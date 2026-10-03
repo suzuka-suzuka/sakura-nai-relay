@@ -52,7 +52,7 @@ export function createApp(config) {
     return csrf;
   }
   async function autoBindMember() {
-    const rows = router.available().filter(row => !editingUpstreams.has(row.id));
+    const rows = router.available().filter(row => !row.exclusive && !editingUpstreams.has(row.id));
     const candidates = []; let cursor = 0;
     await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
       while (cursor < rows.length) {
@@ -64,7 +64,7 @@ export function createApp(config) {
         } catch { /* Failed queries are not eligible for automatic binding. */ }
       }
     }));
-    const available = new Set(router.available().filter(row => !editingUpstreams.has(row.id)).map(row => row.id));
+    const available = new Set(router.available().filter(row => !row.exclusive && !editingUpstreams.has(row.id)).map(row => row.id));
     const selected = candidates.filter(row => available.has(row.id) && store.upstream(row.id)?.token_hash === row.tokenHash)
       .sort((a, b) => b.percent - a.percent || a.id - b.id)[0];
     assert(selected, '没有可绑定的有效 Opus 上游，请检查账户状态或额度查询', 503);
@@ -142,6 +142,7 @@ export function createApp(config) {
         const body = parse(await readBody(req, 16384));
         const name = optionalName(body.name === undefined ? previous?.name ?? '' : body.name);
         assert(typeof body.enabled === 'boolean', '状态无效');
+        assert(body.exclusive === undefined || typeof body.exclusive === 'boolean', '独享状态无效');
         const token = typeof body.token === 'string' ? body.token.trim() : '';
         assert(id !== null || token, '请填写官方 Key');
         if (token) {
@@ -151,8 +152,8 @@ export function createApp(config) {
           assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '该上游有请求正在执行，请稍后更换 Key', 409);
         }
         const savedId = store.transaction(() => {
-          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled });
-          store.updateUpstream(id, { name, token, enabled: body.enabled }); return id;
+          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled, exclusive: body.exclusive });
+          store.updateUpstream(id, { name, token, enabled: body.enabled, exclusive: body.exclusive }); return id;
         });
         if (token) router.reset(savedId);
         return json(res, id === null ? 201 : 200, { id: savedId });
@@ -182,7 +183,10 @@ export function createApp(config) {
     if (path === '/admin/api/keys' && req.method === 'POST') {
       const body = parse(await readBody(req, 4096));
       const name = optionalName(body.name === undefined ? '' : body.name), points = integer(body.points, 0, 1_000_000_000);
-      if (body.tier === 'member') body.upstreamId = await autoBindMember();
+      if (body.tier === 'member') {
+        body.upstreamId = await autoBindMember();
+        assert(!store.upstream(body.upstreamId)?.exclusive, '选定上游已设为独享，请重试', 409);
+      }
       return json(res, 201, store.createKey(name, points, body));
     }
     const secretMatch = /^\/admin\/api\/keys\/(\d+)\/reveal$/.exec(path);

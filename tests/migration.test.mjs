@@ -34,6 +34,32 @@ test('自动名称跳过已占用编号，改名、删除和重启后仍继续�
   }
 });
 
+test('独享字段迁移默认共享，保留绑定、余额和历史，重启后保留独享设置',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-'));let store;
+  try {
+    store=new Store(directory); store.setUpstream('pst-exclusive-migration');
+    const member=store.createKey('原有绑定',88,{tier:'member',upstreamId:1,validDays:30});
+    store.reserve(member.id,'exclusive-history','/ai/generate-image','nai-diffusion-5-full',26,null,1);
+    store.settle('exclusive-history',26,'completed','保留历史',200);
+    const key={...store.key(member.id)},ledger=store.ledger(),jobs=store.jobs();
+    store.db.exec('ALTER TABLE upstreams DROP COLUMN exclusive');
+    store.close();store=new Store(directory);
+    assert.equal(store.upstream(1).exclusive,0); assert.deepEqual({...store.key(member.id)},key);
+    assert.deepEqual(store.ledger(),ledger); assert.deepEqual(store.jobs(),jobs);
+    assert.equal(store.upstreamToken(1),'pst-exclusive-migration');
+    store.updateUpstream(1,{enabled:true,exclusive:true});
+    store.close();store=new Store(directory);
+    assert.equal(store.upstream(1).exclusive,1); assert.equal(store.upstreams()[0].bound_keys,1);
+    assert.deepEqual({...store.key(member.id)},key); assert.deepEqual(store.revealKey(member.id),member);
+    assert.throws(()=>store.createKey('不能重复绑定',0,{tier:'member',upstreamId:1}),/只能绑定一个/);
+    assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(),[]);
+  } finally {
+    store?.close();
+    assert.ok(resolve(directory).startsWith(resolve(tmpdir())+'\\sakura-schema-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/sakura-schema-test-'));
+    rmSync(directory,{recursive:true,force:true});
+  }
+});
+
 test('删除账号权重保留密钥、绑定和流水，原权重零转为停用且只迁移一次',()=>{
   const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-'));let store;
   try {

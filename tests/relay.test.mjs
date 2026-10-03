@@ -711,9 +711,9 @@ test('客户端在收到流后取消，后端仍读取上游并完成 Anlas 结�
   assert.equal(f.app.store.jobs()[0].status,'completed'); assert.equal(f.app.store.key(f.key.id).balance,74);
 });
 
-export async function addAccount(f, token, { enabled = true, ...account } = {}) {
+export async function addAccount(f, token, { enabled = true, exclusive = false, ...account } = {}) {
   f.mock.state.accounts.set(token, { ...f.mock.state, ...account });
-  const res = await f.call('/admin/api/upstreams', 'POST', { name: token.slice(4), token, enabled });
+  const res = await f.call('/admin/api/upstreams', 'POST', { name: token.slice(4), token, enabled, exclusive });
   assert.equal(res.status, 201);
   return (await res.json()).id;
 }
@@ -1278,6 +1278,118 @@ test('Anlas 池仅在余额足够的账号间轮询，不受零余额账号干�
   assert.deepEqual(calls.map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-funded-b' : 'Bearer pst-funded-a'));
   assert.ok(f.app.store.jobs().every(j=>j.route_mode==='anlas-pool' && j.charged===1));
   assert.equal(f.app.store.key(f.key.id).balance,94);
+});
+
+test('独享上游可添加、编辑并保留状态，旧接口省略字段不会清除独享', async t => {
+  const f=await fixture(t), id=await addAccount(f,'pst-exclusive',{exclusive:true});
+  assert.equal(f.app.store.upstream(1).exclusive,0);
+  assert.equal(f.app.store.upstream(id).exclusive,1);
+  assert.equal((await f.call('/admin/api/upstreams/'+id,'PUT',{name:'独享保留',enabled:false})).status,200);
+  assert.equal(f.app.store.upstream(id).exclusive,1);
+  const snapshot=await (await f.call('/admin/api/snapshot')).json();
+  assert.equal(snapshot.upstreams.find(u=>u.id===id).exclusive,1);
+  assert.ok(!JSON.stringify(snapshot).includes('pst-exclusive'));
+  for(const exclusive of ['true',1,null]) {
+    assert.equal((await f.call('/admin/api/upstreams/'+id,'PUT',{enabled:true,exclusive})).status,400);
+    assert.equal((await f.call('/admin/api/upstreams','POST',{token:'pst-invalid-exclusive',enabled:true,exclusive})).status,400);
+  }
+  assert.equal((await f.call('/admin/api/upstreams/'+id,'PUT',{enabled:true,exclusive:false})).status,200);
+  assert.equal(f.app.store.upstream(id).exclusive,0);
+  assert.equal((await f.call('/admin/api/upstreams/'+id,'DELETE')).status,200);
+  const restored=await f.call('/admin/api/upstreams','POST',{token:'pst-exclusive',enabled:true,exclusive:true});
+  assert.equal(restored.status,201); assert.equal((await restored.json()).id,id);
+  assert.equal(f.app.store.upstream(id).exclusive,1);
+});
+
+test('创建会员自动绑定跳过空闲独享上游，仅剩独享时创建失败', async t => {
+  const f=await fixture(t); f.mock.state.paid=false; f.mock.state.usagePercent=20;
+  const exclusive=await addAccount(f,'pst-exclusive-best',{exclusive:true,paid:false,usagePercent:100});
+  f.mock.state.calls=[];
+  const created=await f.call('/admin/api/keys','POST',{name:'自动绑定',points:0,tier:'member',upstreamId:exclusive});
+  assert.equal(created.status,201); assert.equal(f.app.store.key((await created.json()).id).nai5_upstream_id,1);
+  assert.ok(!f.mock.state.calls.some(c=>c.auth==='Bearer pst-exclusive-best'));
+  assert.equal((await f.call('/admin/api/upstreams/1','PUT',{enabled:false})).status,200);
+  assert.equal((await f.call('/admin/api/keys','POST',{name:'无共享上游',points:0,tier:'member'})).status,503);
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,0);
+});
+
+test('独享上游只接受一个手动绑定，停用和过期仍占用，删除或改绑后释放', async t => {
+  const f=await fixture(t), exclusive=await addAccount(f,'pst-exclusive-binding',{exclusive:true});
+  const other=f.app.store.createKey('另一会员',0,{tier:'member',upstreamId:1});
+  await member(f,exclusive);
+  assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',{name:'原绑定可编辑',tier:'member',upstreamId:exclusive})).status,200);
+  assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',{enabled:false,expiresAt:Date.now()-1})).status,200);
+  assert.equal((await f.call('/admin/api/keys/'+other.id,'POST',{upstreamId:exclusive})).status,409);
+  assert.throws(()=>f.app.store.createKey('直接创建也受限',0,{tier:'member',upstreamId:exclusive}),/只能绑定一个/);
+  assert.equal((await f.call('/admin/api/keys/'+f.key.id,'POST',{tier:'standard',upstreamId:null})).status,200);
+  assert.equal((await f.call('/admin/api/keys/'+other.id,'POST',{upstreamId:exclusive})).status,200);
+  assert.equal((await f.call('/admin/api/keys/'+other.id,'DELETE')).status,200);
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,0);
+  await member(f,exclusive);
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,1);
+});
+
+test('并发手动绑定独享上游时只有一个成功，设为共享后允许多个绑定', async t => {
+  const f=await fixture(t), exclusive=await addAccount(f,'pst-exclusive-race',{exclusive:true});
+  const other=f.app.store.createKey('并发会员',0,{tier:'member',upstreamId:1});
+  const responses=await Promise.all([f.key.id,other.id].map(id=>f.call('/admin/api/keys/'+id,'POST',{tier:'member',upstreamId:exclusive})));
+  assert.deepEqual(responses.map(r=>r.status).sort(),[200,409]);
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,1);
+  assert.equal((await f.call('/admin/api/upstreams/'+exclusive,'PUT',{enabled:true,exclusive:false})).status,200);
+  for(const id of [f.key.id,other.id]) assert.equal((await f.call('/admin/api/keys/'+id,'POST',{tier:'member',upstreamId:exclusive})).status,200);
+  assert.equal((await f.call('/admin/api/upstreams/'+exclusive,'PUT',{name:'不可覆盖',token:'pst-exclusive-replacement',enabled:false,exclusive:true})).status,409);
+  assert.equal(f.app.store.upstream(exclusive).exclusive,0); assert.equal(f.app.store.upstream(exclusive).enabled,1);
+  assert.equal(f.app.store.upstreamToken(exclusive),'pst-exclusive-race');
+  assert.equal(f.app.store.upstream(exclusive).name,'exclusive-race');
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,2);
+  f.app.store.updateKey(other.id,{tier:'standard',upstreamId:null});
+  assert.equal((await f.call('/admin/api/upstreams/'+exclusive,'PUT',{enabled:true,exclusive:true})).status,200);
+});
+
+test('删除上游自动换绑跳过独享，仅剩独享时保留原上游和绑定', async t => {
+  const f=await fixture(t); await member(f);
+  const exclusive=await addAccount(f,'pst-exclusive-delete',{exclusive:true,paid:false,usagePercent:100});
+  assert.throws(()=>f.app.store.retireUpstream(1,exclusive),/没有可换绑/);
+  assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,503);
+  assert.equal(f.app.store.key(f.key.id).nai5_upstream_id,1); assert.ok(f.app.store.upstream(1));
+  const shared=await addAccount(f,'pst-shared-delete',{paid:false,usagePercent:30});
+  const response=await f.call('/admin/api/upstreams/1','DELETE');
+  assert.equal(response.status,200); assert.equal((await response.json()).upstreamId,shared);
+  assert.equal(f.app.store.upstreams().find(u=>u.id===exclusive).bound_keys,0);
+});
+
+test('自动绑定查询期间设为独享会重新筛选，创建与删除换绑都不占用独享', async t => {
+  for(const deleting of [false,true]) await t.test(deleting ? '删除换绑' : '创建会员',async t=>{
+    let armed=false,entered,resume;
+    const queried=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{resume=resolve;});
+    const f=await fixture(t,{fetcher:async(url,options)=>{
+      const response=await fetch(url,options);
+      if(armed && options.headers.Authorization==='Bearer pst-exclusive-during-query'){entered();await gate;}
+      return response;
+    }});
+    await member(f); f.mock.state.paid=false; f.mock.state.usagePercent=20;
+    const best=await addAccount(f,'pst-exclusive-during-query',{paid:false,usagePercent:100});
+    const shared=await addAccount(f,'pst-shared-during-query',{paid:false,usagePercent:40}); armed=true;
+    const pending=deleting ? f.call('/admin/api/upstreams/1','DELETE') : f.call('/admin/api/keys','POST',{points:0,tier:'member'});
+    await queried;
+    try { assert.equal((await f.call('/admin/api/upstreams/'+best,'PUT',{enabled:true,exclusive:true})).status,200); }
+    finally { resume(); }
+    const response=await pending; assert.equal(response.status,deleting ? 200 : 201);
+    const result=await response.json();
+    assert.equal(deleting ? result.upstreamId : f.app.store.key(result.id).nai5_upstream_id,shared);
+    assert.equal(f.app.store.upstreams().find(u=>u.id===best).bound_keys,0);
+  });
+});
+
+test('独享只限制绑定，绑定体力计费与普通账号池路由保持原逻辑', async t => {
+  const f=await fixture(t); f.mock.state.paid=false; await member(f);
+  assert.equal((await f.call('/admin/api/upstreams/1','PUT',{enabled:true,exclusive:true})).status,200);
+  assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
+  assert.equal(f.app.store.jobs()[0].route_mode,'nai5-bound'); assert.equal(f.app.store.jobs()[0].charged,0);
+  const standard=f.app.store.createKey('普通池保持',100);
+  assert.equal((await f.relay('/ai/generate-image',payload(),{Authorization:'Bearer '+standard.token})).status,200);
+  assert.equal(f.app.store.jobs()[0].route_mode,'pool'); assert.equal(f.app.store.jobs()[0].charged,26);
+  assert.equal(f.app.store.jobs()[0].upstream_id,1);
 });
 
 test('创建会员实时自动绑定最高 NAI5 额度，排除无效账号且忽略手动指定', async t => {

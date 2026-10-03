@@ -50,8 +50,11 @@ export class Store {
     this.db.exec(`CREATE TABLE IF NOT EXISTS upstreams (
       id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
       suffix TEXT NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, retired_at INTEGER);
+      enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, retired_at INTEGER,
+      exclusive INTEGER NOT NULL DEFAULT 0 CHECK(exclusive IN (0,1)));
     `);
+    if (!this.db.prepare('PRAGMA table_info(upstreams)').all().some(c => c.name === 'exclusive'))
+      this.db.exec('ALTER TABLE upstreams ADD COLUMN exclusive INTEGER NOT NULL DEFAULT 0 CHECK(exclusive IN (0,1))');
     if (this.db.prepare('PRAGMA table_info(upstreams)').all().some(c => c.name === 'weight')) this.transaction(() => {
       // Preserve accounts previously paused through weight=0 before removing the setting.
       this.db.exec('UPDATE upstreams SET enabled=0 WHERE weight=0; ALTER TABLE upstreams DROP COLUMN weight;');
@@ -78,30 +81,34 @@ export class Store {
   set(name, value) { this.db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name, value); }
   transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (error) { this.db.exec('ROLLBACK'); throw error; } }
   upstreams() {
-    return this.db.prepare(`SELECT u.id,u.name,u.suffix,u.enabled,u.created_at,
+    return this.db.prepare(`SELECT u.id,u.name,u.suffix,u.enabled,u.exclusive,u.created_at,
       (SELECT COUNT(*) FROM keys WHERE nai5_upstream_id=u.id AND retired_at IS NULL) AS bound_keys
       FROM upstreams u WHERE retired_at IS NULL ORDER BY id`).all();
   }
   upstream(id) { return this.db.prepare('SELECT * FROM upstreams WHERE id=? AND retired_at IS NULL').get(id); }
   upstreamToken(id = this.upstreams()[0]?.id) { const row = this.upstream(id ?? -1); return row ? unseal(row.token, this.master) : null; }
-  addUpstream({ name, token, enabled = true }) {
+  addUpstream({ name, token, enabled = true, exclusive = false }) {
+    assert(typeof exclusive === 'boolean', '独享状态无效');
     const existing = this.db.prepare('SELECT id,retired_at FROM upstreams WHERE token_hash=?').get(hash(token));
     if (existing) assert(existing.retired_at, '这个上游 Key 已存在，请编辑原有记录', 409);
     name = this.recordName(name ?? '', 'upstreams');
     if (existing) {
-      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=? WHERE id=?').run(name, Number(enabled), existing.id);
+      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=?,exclusive=? WHERE id=?').run(name, Number(enabled), Number(exclusive), existing.id);
       return existing.id;
     }
-    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,created_at) VALUES(?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Date.now());
+    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,exclusive,created_at) VALUES(?,?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Number(exclusive), Date.now());
     return Number(result.lastInsertRowid);
   }
-  updateUpstream(id, { name, token, enabled }) {
+  updateUpstream(id, { name, token, enabled, exclusive }) {
     const previous = this.upstream(id); assert(previous, '上游不存在', 404);
+    assert(exclusive === undefined || typeof exclusive === 'boolean', '独享状态无效');
+    const nextExclusive = exclusive === undefined ? previous.exclusive : Number(exclusive);
+    if (nextExclusive) assert(this.boundKeys(id).length <= 1, '已有多个会员绑定，无法设为独享', 409);
     if (token) {
       assert(!this.db.prepare('SELECT id FROM upstreams WHERE token_hash=? AND id!=?').get(hash(token), id), '这个上游 Key 已存在', 409);
       this.db.prepare('UPDATE upstreams SET token=?,token_hash=?,suffix=? WHERE id=?').run(seal(token, this.master), hash(token), token.slice(-4), id);
     }
-    this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), id);
+    this.db.prepare('UPDATE upstreams SET name=?,enabled=?,exclusive=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), nextExclusive, id);
   }
   boundKeys(id) { return this.db.prepare('SELECT id,reserved FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL').all(id); }
   retireUpstream(id, replacementId = null) {
@@ -110,7 +117,8 @@ export class Store {
       assert(!this.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
       const bindings = this.boundKeys(id);
       if (bindings.length) {
-        assert(replacementId !== id && this.upstream(replacementId ?? -1)?.enabled, '没有可换绑的上游，原上游未移除', 503);
+        const replacement = this.upstream(replacementId ?? -1);
+        assert(replacementId !== id && replacement?.enabled && !replacement.exclusive, '没有可换绑的上游，原上游未移除', 503);
         const running = this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1");
         assert(bindings.every(key => key.reserved === 0 && !running.get(key.id)), '请等待绑定会员的生成和排队结束，再移除上游', 409);
         this.db.prepare('UPDATE keys SET nai5_upstream_id=? WHERE nai5_upstream_id=? AND retired_at IS NULL').run(replacementId, id);
@@ -123,7 +131,7 @@ export class Store {
   // Convenience for local fixtures; runtime routing always supplies an explicit upstream ID.
   setUpstream(token) {
     const first = this.upstreams()[0];
-    if (first) { this.updateUpstream(first.id, { ...first, token }); return first.id; }
+    if (first) { this.updateUpstream(first.id, { ...first, exclusive: !!first.exclusive, token }); return first.id; }
     return this.addUpstream({ name: 'NovelAI 官方', token });
   }
   keys() { return this.db.prepare(`SELECT k.id,k.name,k.prefix,k.balance,k.reserved,k.enabled,k.created_at,k.last_used_at,
@@ -164,7 +172,10 @@ export class Store {
     const binding = tier === 'member' ? (options.upstreamId === undefined ? previous.nai5_upstream_id : options.upstreamId) : null;
     if (tier === 'member') {
       integer(binding, 1, Number.MAX_SAFE_INTEGER, '会员绑定上游');
-      assert(this.upstream(binding), '会员必须绑定一个存在的上游');
+      const upstream = this.upstream(binding);
+      assert(upstream, '会员必须绑定一个存在的上游');
+      if (upstream.exclusive)
+        assert(this.boundKeys(binding).every(key => key.id === previous.id), '独享上游只能绑定一个会员', 409);
     } else assert(options.upstreamId === undefined || options.upstreamId === null, '普通密钥不绑定上游');
     assert(!(options.validDays !== undefined && options.expiresAt !== undefined), '有效天数和到期时间不能同时设置');
     let expires = options.expiresAt === undefined ? previous.expires_at ?? null : options.expiresAt;
