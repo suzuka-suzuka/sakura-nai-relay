@@ -448,7 +448,7 @@ export function createApp(config) {
     try {
       const url = new URL(req.url, config.publicOrigin), path = url.pathname;
       if (path.startsWith('/admin/api/')) return await admin(req, res, path);
-      const accountRoute = path === '/user/subscription' || path === '/user/data';
+      const accountRoute = path === '/user/subscription' || path === '/ai/user/subscription' || path === '/user/data';
       const relayRoute = accountRoute || path === '/ai/generate-image/suggest-tags' || PAID.has(path);
       if (relayRoute) {
         const origin = req.headers.origin;

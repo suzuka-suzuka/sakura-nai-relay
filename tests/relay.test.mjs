@@ -208,6 +208,64 @@ test('普通订阅由本地返回；会员返回绑定上游体力与自身余�
   assert.equal(quota.upstreams[0].account.relay.balance,10000);
 });
 
+test('柏宝绘订阅兼容路径返回相同的普通及会员订阅，查询不改变计费状态', async t => {
+  for (const tier of ['standard', 'member']) await t.test(tier, async t => {
+    const f = await fixture(t);
+    if (tier === 'member') await member(f);
+    f.app.store.updateKey(f.key.id, { expiresAt: Date.now() + 7 * 86400000 });
+    f.mock.state.queryFails = tier === 'standard'; f.mock.state.calls = [];
+    const before = { key: f.app.store.key(f.key.id), jobs: f.app.store.jobs(), ledger: f.app.store.ledger() };
+    const original = await f.relay('/user/subscription'); assert.equal(original.status, 200);
+    const compatible = await f.relay('/ai/user/subscription'); assert.equal(compatible.status, 200);
+    const data = await compatible.json();
+    assert.deepEqual(data, await original.json());
+    assert.equal(data.subscription, undefined); assert.equal(data.tier, tier === 'member' ? 3 : 1);
+    for (const secret of ['private@example.com', 'SHOULD_NOT_LEAK', 'pst-local-test', f.key.token])
+      assert.ok(!JSON.stringify(data).includes(secret));
+    assert.deepEqual(f.mock.state.calls.map(call => call.path), tier === 'member' ? ['/user/subscription', '/user/subscription'] : []);
+    if (tier === 'member') {
+      f.mock.state.queryFails = true;
+      assert.equal((await f.relay('/ai/user/subscription')).status, 502);
+    }
+    assert.deepEqual({ key: f.app.store.key(f.key.id), jobs: f.app.store.jobs(), ledger: f.app.store.ledger() }, before);
+  });
+});
+
+test('柏宝绘订阅兼容路径沿用跨域预检、来源限制和密钥校验，只接受 GET', async t => {
+  const f = await fixture(t), path = '/ai/user/subscription', website = 'http://127.0.0.1:3000';
+  f.mock.state.calls = [];
+  const preflight = origin => fetch(f.base + path, { method: 'OPTIONS', headers: {
+    Origin: origin, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization',
+  } });
+  const pre = await preflight(website);
+  assert.equal(pre.status, 204); assert.equal(pre.headers.get('access-control-allow-origin'), website);
+  assert.equal(pre.headers.get('vary'), 'Origin'); assert.match(pre.headers.get('access-control-allow-headers'), /Authorization/i);
+  const allowed = await f.relay(path, undefined, { Origin: website });
+  assert.equal(allowed.status, 200); assert.equal(allowed.headers.get('access-control-allow-origin'), website);
+  for (const headers of [{}, { Authorization: 'Bearer skr_' + 'x'.repeat(43) }]) {
+    const response = await fetch(f.base + path, { headers: { Origin: website, ...headers } });
+    assert.equal(response.status, 401); assert.equal(response.headers.get('access-control-allow-origin'), website);
+  }
+  assert.equal((await preflight('https://unlisted.example')).status, 403);
+  assert.equal((await f.relay(path, undefined, { Origin: 'https://unlisted.example' })).status, 403);
+  assert.equal((await f.relay(path, {}, { Origin: website })).status, 405);
+  f.app.store.updateKey(f.key.id, { enabled: false });
+  assert.equal((await f.relay(path)).status, 401);
+  f.app.store.updateKey(f.key.id, { enabled: true, expiresAt: Date.now() - 1 });
+  const expired = await f.relay(path); assert.equal(expired.status, 403);
+  assert.equal((await expired.json()).code, 'KEY_EXPIRED');
+  f.app.store.updateKey(f.key.id, { expiresAt: null }); f.app.store.set('enabled', 'false');
+  assert.equal((await f.relay(path)).status, 503);
+  assert.equal((await f.call('/admin/api/settings', 'PUT', { enabled: true, origins: ['*'] })).status, 200);
+  for (const origin of ['https://baibai.example', 'null']) {
+    const pre = await preflight(origin);
+    assert.equal(pre.status, 204); assert.equal(pre.headers.get('access-control-allow-origin'), origin);
+    const response = await f.relay(path, undefined, { Origin: origin });
+    assert.equal(response.status, 200); assert.equal(response.headers.get('access-control-allow-origin'), origin);
+  }
+  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+});
+
 test('user/data 普通账号可解析下游套餐、可用余额和有效期，上游故障不影响查询', async t => {
   const f = await fixture(t), expiresAt = Date.now() + 7 * 86400000;
   f.app.store.updateKey(f.key.id, { expiresAt });
