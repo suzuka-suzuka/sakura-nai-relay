@@ -398,7 +398,7 @@ test('删除会员密钥和上游保留各自的历史记录', async t => {
   const snapshot = await (await f.call('/admin/api/snapshot')).json();
   assert.equal(snapshot.keys.length, 0); assert.equal(snapshot.upstreams.length, 0);
   assert.equal(snapshot.jobs[0].key_name, '测试用户'); assert.equal(snapshot.jobs[0].upstream_name, 'Mock');
-  assert.equal(snapshot.ledger.filter(row => row.kind === 'usage').length, 1);
+  assert.equal(snapshot.ledger.filter(row => row.kind === 'usage').length, 0);
   assert.deepEqual(f.app.store.db.prepare('PRAGMA foreign_key_check').all(), []);
 });
 

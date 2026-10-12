@@ -3,8 +3,19 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { hash, random, seal, unseal, assert, integer, HttpError } from './security.mjs';
-import { KEY_COLUMNS, migrateLocalStamina } from './migrate-local-stamina.mjs';
 import { capacityFor, dailyFor, refillPeriod, availableStamina } from './stamina.mjs';
+
+const KEY_COLUMNS = `
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, prefix TEXT NOT NULL,
+  balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0), reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved >= 0),
+  token_encrypted TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('standard','member')),
+  expires_at INTEGER, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+  last_used_at INTEGER, retired_at INTEGER,
+  stamina_capacity INTEGER NOT NULL DEFAULT 0 CHECK(stamina_capacity BETWEEN 0 AND 112000),
+  stamina_balance INTEGER NOT NULL DEFAULT 0 CHECK(stamina_balance BETWEEN 0 AND stamina_capacity),
+  stamina_reserved INTEGER NOT NULL DEFAULT 0 CHECK(stamina_reserved BETWEEN 0 AND stamina_balance),
+  stamina_refill_period INTEGER NOT NULL CHECK(stamina_refill_period >= 0),
+  CHECK(tier='member' OR (stamina_capacity=0 AND stamina_balance=0 AND stamina_reserved=0))`;
 
 export class Store {
   constructor(directory) {
@@ -37,6 +48,7 @@ export class Store {
         upstream_id INTEGER NOT NULL REFERENCES upstreams(id), upstream_name TEXT NOT NULL,
         tier_snapshot TEXT NOT NULL, route_mode TEXT NOT NULL, upstream_estimate INTEGER NOT NULL,
         upstream_spent INTEGER NOT NULL DEFAULT 0,
+        stamina_reserved INTEGER NOT NULL DEFAULT 0, stamina_charged INTEGER,
         idempotency TEXT, UNIQUE(key_id, idempotency));
       CREATE TABLE IF NOT EXISTS ledger (
         id INTEGER PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys(id), delta INTEGER NOT NULL,
@@ -59,7 +71,6 @@ export class Store {
     if (!this.db.prepare('PRAGMA table_info(keys)').all().some(c => c.name === 'retired_at'))
       this.db.exec('ALTER TABLE keys ADD COLUMN retired_at INTEGER');
     this.db.exec('CREATE INDEX IF NOT EXISTS jobs_upstream_state ON jobs(upstream_id,status)');
-    try { migrateLocalStamina(this.db, directory); } catch (error) { this.db.close(); throw error; }
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
       this.fail(job.id, '服务中断，任务失败，已自动释放预留点数和体力');
@@ -174,7 +185,7 @@ export class Store {
       const result = this.db.prepare(`INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,expires_at,stamina_capacity,stamina_balance,stamina_refill_period)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,dailyFor(capacity),0);
       const id = Number(result.lastInsertRowid);
-      this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
+      if (balance !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
       return { id, token };
     });
   }
@@ -205,7 +216,7 @@ export class Store {
       const key = this.key(id); assert(key, '密钥不存在', 404);
       integer(key.balance + delta, key.reserved, 1_000_000_000, '调整后余额');
       this.db.prepare('UPDATE keys SET balance=balance+? WHERE id=?').run(delta, id);
-      this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, delta, 'adjust', note, Date.now());
+      if (delta !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, delta, 'adjust', note, Date.now());
     });
   }
   reserve(keyId, id, endpoint, model, amount, idempotency, upstreamId, { mode = 'pool', upstreamEstimate = 0, stamina = 0 } = {}) {
@@ -231,13 +242,13 @@ export class Store {
       const staminaCharged = status === 'completed' ? job.stamina_reserved : 0;
       this.db.prepare('UPDATE keys SET reserved=reserved-?,balance=balance-?,stamina_reserved=stamina_reserved-?,stamina_balance=stamina_balance-? WHERE id=?').run(job.reserved,charged,job.stamina_reserved,staminaCharged,job.key_id);
       this.db.prepare('UPDATE jobs SET status=?,charged=?,upstream_spent=?,http_status=?,note=?,finished_at=?,stamina_charged=? WHERE id=?').run(status,charged,status === 'completed' ? job.upstream_estimate : 0,http,note,Date.now(),staminaCharged,id);
-      this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,job_id,created_at) VALUES(?,?,?,?,?,?)').run(job.key_id, -charged, 'usage', note, id, Date.now());
+      if (charged > 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,job_id,created_at) VALUES(?,?,?,?,?,?)').run(job.key_id, -charged, 'usage', note, id, Date.now());
     });
   }
   fail(id, note, http = null) {
     if (this.db.prepare("SELECT id FROM jobs WHERE id=? AND status='running'").get(id)) this.settle(id, 0, 'failed', note, http);
   }
   jobs(limit = 100) { return this.db.prepare('SELECT jobs.*,keys.name AS key_name FROM jobs JOIN keys ON keys.id=jobs.key_id ORDER BY jobs.rowid DESC LIMIT ?').all(limit); }
-  ledger(limit = 100) { return this.db.prepare('SELECT ledger.*,keys.name AS key_name FROM ledger JOIN keys ON keys.id=ledger.key_id ORDER BY ledger.id DESC LIMIT ?').all(limit); }
+  ledger(limit = 100) { return this.db.prepare('SELECT ledger.*,keys.name AS key_name FROM ledger JOIN keys ON keys.id=ledger.key_id WHERE ledger.delta != 0 ORDER BY ledger.id DESC LIMIT ?').all(limit); }
   close() { this.db.close(); }
 }

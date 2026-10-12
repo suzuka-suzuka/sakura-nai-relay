@@ -144,10 +144,10 @@ test('启动自动释放历史待处理及旧核对任务，重复重启不重�
     store.close(); store=new Store(directory);
     assert.equal(store.key(key.id).balance,100); assert.equal(store.key(key.id).reserved,0);
     assert.ok(store.jobs().every(j=>j.status==='failed' && j.charged===0 && j.upstream_spent===0));
-    assert.equal(store.ledger().filter(l=>l.kind==='usage').length,2);
+    assert.equal(store.ledger().filter(l=>l.kind==='usage').length,0);
     store.close(); store=new Store(directory);
     assert.equal(store.key(key.id).reserved,0); assert.equal(store.key(key.id).balance,100);
-    assert.equal(store.ledger().filter(l=>l.kind==='usage').length,2);
+    assert.equal(store.ledger().filter(l=>l.kind==='usage').length,0);
   } finally {
     store?.close();
     assert.ok(resolve(directory).startsWith(resolve(tmpdir())+'\\sakura-schema-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/sakura-schema-test-'));
