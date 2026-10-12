@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { Store } from './db.mjs';
 import { HttpError, assert, integer, hash, random, equal, passwordHash, verifyPassword } from './security.mjs';
-import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount, isActiveOpus, hasNai5Allowance, isNai5Generation, reservation, StreamCheck } from './billing.mjs';
+import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount, isActiveOpus, hasNai5Allowance, isNai5Generation, reservation, quoteRequest, StreamCheck } from './billing.mjs';
+import { hasLocalStamina } from './stamina.mjs';
 import { upstreamClient, readBounded } from './upstream.mjs';
 import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
@@ -50,25 +51,6 @@ export function createApp(config) {
     store.db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(token), csrf, Date.now() + 12 * 3600000);
     res.setHeader('Set-Cookie', `sakura_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${config.cookieSecure ? '; Secure' : ''}`);
     return csrf;
-  }
-  async function autoBindMember() {
-    const rows = router.available().filter(row => !row.exclusive && !editingUpstreams.has(row.id));
-    const candidates = []; let cursor = 0;
-    await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
-      while (cursor < rows.length) {
-        const row = rows[cursor++], tokenHash = store.upstream(row.id)?.token_hash;
-        try {
-          const data = await upstream.subscription(store.upstreamToken(row.id));
-          if (isActiveOpus(data) && Number.isFinite(data.usage?.percent) && typeof data.usage?.isNegative === 'boolean')
-            candidates.push({ id: row.id, percent: hasNai5Allowance(data) ? Math.max(0, Math.min(100, data.usage.percent)) : 0, tokenHash });
-        } catch { /* Failed queries are not eligible for automatic binding. */ }
-      }
-    }));
-    const available = new Set(router.available().filter(row => !row.exclusive && !editingUpstreams.has(row.id)).map(row => row.id));
-    const selected = candidates.filter(row => available.has(row.id) && store.upstream(row.id)?.token_hash === row.tokenHash)
-      .sort((a, b) => b.percent - a.percent || a.id - b.id)[0];
-    assert(selected, '没有可绑定的有效 Opus 上游，请检查账户状态或额度查询', 503);
-    return selected.id;
   }
   async function admin(req, res, path) {
     if (req.method !== 'GET') assert(req.headers.origin === config.publicOrigin, '请求来源不匹配，请检查 PUBLIC_ORIGIN', 403);
@@ -125,24 +107,13 @@ export function createApp(config) {
       if (id !== null) editingUpstreams.add(id);
       try {
         if (req.method === 'DELETE') {
-          const assertCanRemove = () => {
-            assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
-            assert(store.boundKeys(id).every(key => !router.keyQueue.size(key.id)), '请等待绑定会员的生成和排队结束，再移除上游', 409);
-          };
-          assertCanRemove();
-          const upstreamId = store.boundKeys(id).length ? await autoBindMember() : null;
-          assertCanRemove();
-          if (upstreamId !== null) {
-            router.assertAvailable(upstreamId);
-            assert(!editingUpstreams.has(upstreamId), '替代上游正在更新，请稍后重试', 409);
-          }
-          const reboundKeys = store.retireUpstream(id, upstreamId); router.reset(id);
-          return json(res, 200, { ok: true, reboundKeys, upstreamId });
+          assert(!router.busy.has(id) && !store.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
+          store.retireUpstream(id); router.reset(id);
+          return json(res, 200, { ok: true });
         }
         const body = parse(await readBody(req, 16384));
         const name = optionalName(body.name === undefined ? previous?.name ?? '' : body.name);
         assert(typeof body.enabled === 'boolean', '状态无效');
-        assert(body.exclusive === undefined || typeof body.exclusive === 'boolean', '独享状态无效');
         const token = typeof body.token === 'string' ? body.token.trim() : '';
         assert(id !== null || token, '请填写官方 Key');
         if (token) {
@@ -152,8 +123,8 @@ export function createApp(config) {
           assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '该上游有请求正在执行，请稍后更换 Key', 409);
         }
         const savedId = store.transaction(() => {
-          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled, exclusive: body.exclusive });
-          store.updateUpstream(id, { name, token, enabled: body.enabled, exclusive: body.exclusive }); return id;
+          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled });
+          store.updateUpstream(id, { name, token, enabled: body.enabled }); return id;
         });
         if (token) router.reset(savedId);
         return json(res, id === null ? 201 : 200, { id: savedId });
@@ -183,10 +154,6 @@ export function createApp(config) {
     if (path === '/admin/api/keys' && req.method === 'POST') {
       const body = parse(await readBody(req, 4096));
       const name = optionalName(body.name === undefined ? '' : body.name), points = integer(body.points, 0, 1_000_000_000);
-      if (body.tier === 'member') {
-        body.upstreamId = await autoBindMember();
-        assert(!store.upstream(body.upstreamId)?.exclusive, '选定上游已设为独享，请重试', 409);
-      }
       return json(res, 201, store.createKey(name, points, body));
     }
     const secretMatch = /^\/admin\/api\/keys\/(\d+)\/reveal$/.exec(path);
@@ -208,8 +175,8 @@ export function createApp(config) {
       if (keyMatch[2]) store.adjust(id, integer(body.delta, -1_000_000_000, 1_000_000_000), optionalNote(body.note));
       else {
         if (body.name !== undefined) body.name = optionalName(body.name);
-        if (body.tier !== undefined || body.upstreamId !== undefined)
-          assert(!router.keyQueue.size(id), '请等待该密钥的生成和排队结束，再修改等级或绑定', 409);
+        if (body.tier !== undefined || body.staminaPercent !== undefined)
+          assert(!router.keyQueue.size(id), '请等待该密钥的生成和排队结束，再修改等级或体力上限', 409);
         store.updateKey(id, body);
       }
       return json(res, 200, { ok: true });
@@ -227,9 +194,11 @@ export function createApp(config) {
 
   async function selectUpstream(path, body, keyId, signal) {
     const key = store.usableKey(keyId);
-    let account = billingAccount(key), mode = key.tier === 'member' ? 'anlas-pool' : 'pool';
+    const { amount, stamina } = quoteRequest(path, body, key);
+    const strictStamina = stamina > 0, mode = key.tier === 'member' ? 'anlas-pool' : 'pool';
     const requireAnlas = key.tier === 'member';
-    let exhaustedNai5 = false;
+    const exhaustedNai5 = key.tier === 'member' && isNai5Generation(path, body) && !hasLocalStamina(key);
+    const staminaUnavailable = () => new HttpError(503, '本地体力可用，但上游暂无可承接本次请求的 V5 体力，请联系管理员补充上游账号', 'UPSTREAM_STAMINA_UNAVAILABLE');
     const inspect = async id => {
       const unlock = await router.lockUpstream(id, signal);
       try {
@@ -244,30 +213,19 @@ export function createApp(config) {
         return { id, name: row.name, token, subscription, unlock };
       } catch (error) { unlock(); throw error; }
     };
-    // Only a free V5 request uses the binding. Paid requests retain the binding's local entitlement but use a pool.
-    if (key.tier === 'member' && isNai5Generation(path, body)) {
-      const selected = await inspect(key.nai5_upstream_id);
-      try {
-        account = billingAccount(key, selected.subscription);
-        exhaustedNai5 = !hasNai5Allowance(selected.subscription);
-        const amount = reservation(path, body, account);
-        if (!exhaustedNai5 && amount === 0)
-          return { ...selected, amount, upstreamEstimate: reservation(path, body, selected.subscription), mode: 'nai5-bound' };
-      } catch (error) { selected.unlock(); throw error; }
-      selected.unlock();
-      if (exhaustedNai5) mode = 'nai5-paid-pool';
-    }
-    const amount = reservation(path, body, account);
     const current = store.usableKey(keyId);
     assert(current.balance - current.reserved >= amount, `Anlas 不足，本次需要 ${amount} Anlas`, 402);
     let lastError = null, pools = [null];
     if (key.tier === 'member') {
       // Read-only discovery does not occupy generation slots. Recheck under the selected account's lock below.
-      const rows = router.available(); let cursor = 0;
+      let rows;
+      try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(); throw error; }
+      let cursor = 0;
+      const staminaPool = { scope: 'stamina', ids: new Set(), mode: 'nai5-local-stamina' };
       const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
       const anlasPool = { scope: 'anlas', ids: new Set(), mode };
       const preferFree = amount === 0 || exhaustedNai5;
-      pools = preferFree ? [freePool, anlasPool] : [anlasPool];
+      pools = strictStamina ? [staminaPool] : preferFree ? [freePool, anlasPool] : [anlasPool];
       await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
         while (cursor < rows.length && !signal.aborted) {
           const row = rows[cursor++];
@@ -275,6 +233,7 @@ export function createApp(config) {
           try {
             const subscription = await upstream.subscription(store.upstreamToken(row.id));
             const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
+            if (strictStamina && hasNai5Allowance(subscription) && estimate === amount && balance >= estimate) staminaPool.ids.add(row.id);
             if (preferFree && isActiveOpus(subscription) && estimate === 0) freePool.ids.add(row.id);
             if (balance > 0 && balance >= estimate) anlasPool.ids.add(row.id);
           } catch (error) { router.failed(row.id, '上游账户查询失败'); lastError = error; }
@@ -287,7 +246,7 @@ export function createApp(config) {
       const excluded = new Set();
       while (excluded.size < store.upstreams().length) {
         let row;
-        try { row = router.pick(excluded, pool); } catch (error) { if (lastError) throw lastError; throw error; }
+        try { row = router.pick(excluded, pool); } catch (error) { if (strictStamina) throw staminaUnavailable(); if (lastError) throw lastError; throw error; }
         if (!row) break;
         excluded.add(row.id);
         let selected;
@@ -300,9 +259,10 @@ export function createApp(config) {
         try {
           const upstreamEstimate = reservation(path, body, selected.subscription), balance = balanceOf(selected.subscription);
           const funded = balance > 0 && balance >= upstreamEstimate;
-          const usable = pool?.scope === 'free' ? isActiveOpus(selected.subscription) && upstreamEstimate === 0
+          const usable = pool?.scope === 'stamina' ? hasNai5Allowance(selected.subscription) && upstreamEstimate === amount && balance >= upstreamEstimate
+            : pool?.scope === 'free' ? isActiveOpus(selected.subscription) && upstreamEstimate === 0
             : requireAnlas ? funded : balance >= upstreamEstimate;
-          if (usable) return { ...selected, amount, upstreamEstimate, mode: pool?.mode ?? mode, pool };
+          if (usable) return { ...selected, amount, stamina, upstreamEstimate, mode: pool?.mode ?? mode, pool };
           // Free eligibility can disappear while queued; the refreshed account may still join the funded pool.
           if (pool?.scope === 'free') {
             const anlasPool = pools.find(p => p?.scope === 'anlas');
@@ -313,6 +273,7 @@ export function createApp(config) {
         selected.unlock();
       }
     }
+    if (strictStamina) throw staminaUnavailable();
     if (lastError) throw lastError;
     throw new HttpError(503, '账号池没有余额足够的可用上游，请联系管理员补充 Anlas');
   }
@@ -369,12 +330,12 @@ export function createApp(config) {
       selected = await selectUpstream(path, body, key.id, waiting.signal);
       assert(!waiting.signal.aborted, '请求已取消', 499);
       assert(options().enabled, '中转已暂停', 503);
-      const { token, amount, upstreamEstimate, mode } = selected;
+      const { token, amount, stamina, upstreamEstimate, mode } = selected;
       const id = random().slice(0, 18);
-      store.reserve(key.id, id, path, body.model ?? body.req_type ?? 'image-tool', amount, idempotency, selected.id, { mode, upstreamEstimate });
+      store.reserve(key.id,id,path,body.model ?? body.req_type ?? 'image-tool',amount,idempotency,selected.id,{ mode,upstreamEstimate,stamina });
       jobId = id;
       res.setHeader('X-Request-Id', id);
-      if (mode !== 'nai5-bound') router.commit(selected.id, selected.pool);
+      router.commit(selected.id, selected.pool);
       const response = await upstream.request(path, token, { method: 'POST', headers: { 'Content-Type': type, Accept: streaming ? 'text/event-stream' : req.headers.accept ?? 'application/zip, application/json' }, body: payload });
       status = response.status;
       if (!response.ok) {
@@ -467,13 +428,9 @@ export function createApp(config) {
         assert(options().enabled, '中转已暂停', 503);
         if (PAID.has(path)) return await paid(req, res, path, key);
         if (accountRoute) {
-          const data = key.tier === 'member' ? await upstream.subscription(store.upstreamToken(key.nai5_upstream_id)) : null;
           const current = store.usableKey(key.id);
-          assert(current.tier === key.tier && current.nai5_upstream_id === key.nai5_upstream_id, '密钥等级或绑定已变化，请重新查询订阅', 409);
-          const subscription = downstreamSubscription(current, data);
+          const subscription = downstreamSubscription(current);
           if (path === '/user/data') {
-            const recoveryTime = data?.usage?.timeUntilNextPercent;
-            if (Number.isFinite(recoveryTime) && recoveryTime >= 0) subscription.usage.timeUntilNextPercent = recoveryTime;
             return json(res, 200, { subscription });
           }
           return json(res, 200, subscription);

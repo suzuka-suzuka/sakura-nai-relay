@@ -3,6 +3,8 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { hash, random, seal, unseal, assert, integer, HttpError } from './security.mjs';
+import { KEY_COLUMNS, migrateLocalStamina } from './migrate-local-stamina.mjs';
+import { capacityFor, dailyFor, refillPeriod, availableStamina } from './stamina.mjs';
 
 export class Store {
   constructor(directory) {
@@ -26,13 +28,7 @@ export class Store {
     });
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS keys (
-        id INTEGER PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, prefix TEXT NOT NULL,
-        balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0), reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved >= 0),
-        token_encrypted TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('standard','member')),
-        nai5_upstream_id INTEGER REFERENCES upstreams(id), expires_at INTEGER,
-        enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_used_at INTEGER, retired_at INTEGER,
-        CHECK((tier='member' AND nai5_upstream_id IS NOT NULL) OR (tier='standard' AND nai5_upstream_id IS NULL)));
+      CREATE TABLE IF NOT EXISTS keys (${KEY_COLUMNS});
       CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys(id), endpoint TEXT NOT NULL, model TEXT,
@@ -50,11 +46,8 @@ export class Store {
     this.db.exec(`CREATE TABLE IF NOT EXISTS upstreams (
       id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
       suffix TEXT NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, retired_at INTEGER,
-      exclusive INTEGER NOT NULL DEFAULT 0 CHECK(exclusive IN (0,1)));
+      enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, retired_at INTEGER);
     `);
-    if (!this.db.prepare('PRAGMA table_info(upstreams)').all().some(c => c.name === 'exclusive'))
-      this.db.exec('ALTER TABLE upstreams ADD COLUMN exclusive INTEGER NOT NULL DEFAULT 0 CHECK(exclusive IN (0,1))');
     if (this.db.prepare('PRAGMA table_info(upstreams)').all().some(c => c.name === 'weight')) this.transaction(() => {
       // Preserve accounts previously paused through weight=0 before removing the setting.
       this.db.exec('UPDATE upstreams SET enabled=0 WHERE weight=0; ALTER TABLE upstreams DROP COLUMN weight;');
@@ -66,10 +59,10 @@ export class Store {
     if (!this.db.prepare('PRAGMA table_info(keys)').all().some(c => c.name === 'retired_at'))
       this.db.exec('ALTER TABLE keys ADD COLUMN retired_at INTEGER');
     this.db.exec('CREATE INDEX IF NOT EXISTS jobs_upstream_state ON jobs(upstream_id,status)');
-    this.db.exec('CREATE INDEX IF NOT EXISTS keys_binding ON keys(nai5_upstream_id)');
+    try { migrateLocalStamina(this.db, directory); } catch (error) { this.db.close(); throw error; }
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
-      this.fail(job.id, '服务中断，任务失败，已自动释放预留点数');
+      this.fail(job.id, '服务中断，任务失败，已自动释放预留点数和体力');
     this.db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
     if (!this.get('admin_password') && !this.get('setup_hash')) {
       const token = random();
@@ -81,66 +74,60 @@ export class Store {
   set(name, value) { this.db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name, value); }
   transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (error) { this.db.exec('ROLLBACK'); throw error; } }
   upstreams() {
-    return this.db.prepare(`SELECT u.id,u.name,u.suffix,u.enabled,u.exclusive,u.created_at,
-      (SELECT COUNT(*) FROM keys WHERE nai5_upstream_id=u.id AND retired_at IS NULL) AS bound_keys
-      FROM upstreams u WHERE retired_at IS NULL ORDER BY id`).all();
+    return this.db.prepare('SELECT id,name,suffix,enabled,created_at FROM upstreams WHERE retired_at IS NULL ORDER BY id').all();
   }
   upstream(id) { return this.db.prepare('SELECT * FROM upstreams WHERE id=? AND retired_at IS NULL').get(id); }
   upstreamToken(id = this.upstreams()[0]?.id) { const row = this.upstream(id ?? -1); return row ? unseal(row.token, this.master) : null; }
-  addUpstream({ name, token, enabled = true, exclusive = false }) {
-    assert(typeof exclusive === 'boolean', '独享状态无效');
+  addUpstream({ name, token, enabled = true }) {
     const existing = this.db.prepare('SELECT id,retired_at FROM upstreams WHERE token_hash=?').get(hash(token));
     if (existing) assert(existing.retired_at, '这个上游 Key 已存在，请编辑原有记录', 409);
     name = this.recordName(name ?? '', 'upstreams');
     if (existing) {
-      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=?,exclusive=? WHERE id=?').run(name, Number(enabled), Number(exclusive), existing.id);
+      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=? WHERE id=?').run(name, Number(enabled), existing.id);
       return existing.id;
     }
-    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,exclusive,created_at) VALUES(?,?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Number(exclusive), Date.now());
+    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,created_at) VALUES(?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Date.now());
     return Number(result.lastInsertRowid);
   }
-  updateUpstream(id, { name, token, enabled, exclusive }) {
+  updateUpstream(id, { name, token, enabled }) {
     const previous = this.upstream(id); assert(previous, '上游不存在', 404);
-    assert(exclusive === undefined || typeof exclusive === 'boolean', '独享状态无效');
-    const nextExclusive = exclusive === undefined ? previous.exclusive : Number(exclusive);
-    if (nextExclusive) assert(this.boundKeys(id).length <= 1, '已有多个会员绑定，无法设为独享', 409);
     if (token) {
       assert(!this.db.prepare('SELECT id FROM upstreams WHERE token_hash=? AND id!=?').get(hash(token), id), '这个上游 Key 已存在', 409);
       this.db.prepare('UPDATE upstreams SET token=?,token_hash=?,suffix=? WHERE id=?').run(seal(token, this.master), hash(token), token.slice(-4), id);
     }
-    this.db.prepare('UPDATE upstreams SET name=?,enabled=?,exclusive=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), nextExclusive, id);
+    this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), id);
   }
-  boundKeys(id) { return this.db.prepare('SELECT id,reserved FROM keys WHERE nai5_upstream_id=? AND retired_at IS NULL').all(id); }
-  retireUpstream(id, replacementId = null) {
+  retireUpstream(id) {
     return this.transaction(() => {
       assert(this.upstream(id), '上游不存在', 404);
       assert(!this.hasUnsettled(id), '该上游仍有进行中的请求，暂不能移除', 409);
-      const bindings = this.boundKeys(id);
-      if (bindings.length) {
-        const replacement = this.upstream(replacementId ?? -1);
-        assert(replacementId !== id && replacement?.enabled && !replacement.exclusive, '没有可换绑的上游，原上游未移除', 503);
-        const running = this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1");
-        assert(bindings.every(key => key.reserved === 0 && !running.get(key.id)), '请等待绑定会员的生成和排队结束，再移除上游', 409);
-        this.db.prepare('UPDATE keys SET nai5_upstream_id=? WHERE nai5_upstream_id=? AND retired_at IS NULL').run(replacementId, id);
-      }
       this.db.prepare('UPDATE upstreams SET enabled=0,retired_at=? WHERE id=?').run(Date.now(), id);
-      return bindings.length;
     });
   }
   hasUnsettled(id) { return !!this.db.prepare("SELECT id FROM jobs WHERE upstream_id=? AND status='running' LIMIT 1").get(id); }
   // Convenience for local fixtures; runtime routing always supplies an explicit upstream ID.
   setUpstream(token) {
     const first = this.upstreams()[0];
-    if (first) { this.updateUpstream(first.id, { ...first, exclusive: !!first.exclusive, token }); return first.id; }
+    if (first) { this.updateUpstream(first.id, { ...first, token }); return first.id; }
     return this.addUpstream({ name: 'NovelAI 官方', token });
   }
-  keys() { return this.db.prepare(`SELECT k.id,k.name,k.prefix,k.balance,k.reserved,k.enabled,k.created_at,k.last_used_at,
-    k.tier,k.nai5_upstream_id,k.expires_at,u.name AS upstream_name FROM keys k LEFT JOIN upstreams u ON u.id=k.nai5_upstream_id WHERE k.retired_at IS NULL ORDER BY k.id DESC`).all(); }
+  keys() {
+    for (const key of this.db.prepare("SELECT * FROM keys WHERE tier='member' AND retired_at IS NULL").all()) this.refillStamina(key);
+    return this.db.prepare(`SELECT id,name,prefix,balance,reserved,enabled,created_at,last_used_at,tier,expires_at,
+      stamina_capacity,stamina_balance,stamina_reserved,stamina_refill_period FROM keys WHERE retired_at IS NULL ORDER BY id DESC`).all();
+  }
   key(id) { return this.db.prepare('SELECT * FROM keys WHERE id=? AND retired_at IS NULL').get(id); }
+  refillStamina(key, now = Date.now()) {
+    const period = refillPeriod(key.created_at,now);
+    if (key.tier !== 'member' || period <= key.stamina_refill_period) return key;
+    this.db.prepare(`UPDATE keys SET stamina_balance=MIN(stamina_capacity,stamina_balance+?),stamina_refill_period=?
+      WHERE id=? AND stamina_refill_period=? AND retired_at IS NULL`).run((period-key.stamina_refill_period)*dailyFor(key.stamina_capacity),period,key.id,key.stamina_refill_period);
+    return this.key(key.id);
+  }
   usableKey(id) {
     const key = this.key(id); assert(key?.enabled, '中转密钥无效或已停用', 401);
     if (key.expires_at !== null && key.expires_at <= Date.now()) throw new HttpError(403, '访问密钥已过期，请联系管理员续期', 'KEY_EXPIRED');
-    return key;
+    return this.refillStamina(key);
   }
   authenticate(token) {
     const key = this.db.prepare('SELECT id FROM keys WHERE token_hash=? AND retired_at IS NULL').get(hash(token));
@@ -169,26 +156,23 @@ export class Store {
   keySettings(options, previous = {}) {
     const tier = options.tier ?? previous.tier ?? 'standard';
     assert(['standard', 'member'].includes(tier), '等级只能是普通或会员');
-    const binding = tier === 'member' ? (options.upstreamId === undefined ? previous.nai5_upstream_id : options.upstreamId) : null;
-    if (tier === 'member') {
-      integer(binding, 1, Number.MAX_SAFE_INTEGER, '会员绑定上游');
-      const upstream = this.upstream(binding);
-      assert(upstream, '会员必须绑定一个存在的上游');
-      if (upstream.exclusive)
-        assert(this.boundKeys(binding).every(key => key.id === previous.id), '独享上游只能绑定一个会员', 409);
-    } else assert(options.upstreamId === undefined || options.upstreamId === null, '普通密钥不绑定上游');
+    assert(options.staminaPercent === undefined || tier === 'member', '普通密钥不能分配体力');
+    const percent = options.staminaPercent === undefined ? (previous.tier === 'member' ? previous.stamina_capacity / 1120 : 25) : options.staminaPercent;
+    const capacity = tier === 'member' ? capacityFor(integer(percent, 1, 100, '体力上限')) : 0;
     assert(!(options.validDays !== undefined && options.expiresAt !== undefined), '有效天数和到期时间不能同时设置');
     let expires = options.expiresAt === undefined ? previous.expires_at ?? null : options.expiresAt;
     if (options.validDays !== undefined) expires = Math.max(Date.now(), previous.expires_at ?? 0) + integer(options.validDays, 1, 36500, '有效天数') * 86400000;
     if (expires !== null) integer(expires, 1, 8640000000000000, '到期时间');
-    return { tier, binding, expires };
+    return { tier, capacity, expires };
   }
   createKey(name, balance, options = {}) {
     const token = `skr_${random()}`;
     return this.transaction(() => {
-      const { tier, binding, expires } = this.keySettings(options);
+      const createdAt = Date.now();
+      const { tier, capacity, expires } = this.keySettings(options);
       name = this.recordName(name ?? '', 'keys');
-      const result = this.db.prepare('INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,nai5_upstream_id,expires_at) VALUES(?,?,?,?,?,?,?,?,?)').run(name, hash(token), `${token.slice(0, 10)}…${token.slice(-4)}`, balance, Date.now(), seal(token, this.master), tier, binding, expires);
+      const result = this.db.prepare(`INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,expires_at,stamina_capacity,stamina_balance,stamina_refill_period)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,dailyFor(capacity),0);
       const id = Number(result.lastInsertRowid);
       this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
       return { id, token };
@@ -196,17 +180,21 @@ export class Store {
   }
   updateKey(id, options) {
     this.transaction(() => {
-      const key = this.key(id); assert(key, '密钥不存在', 404);
-      const { tier, binding, expires } = this.keySettings(options, key);
+      let key = this.key(id); assert(key, '密钥不存在', 404);
+      key = this.refillStamina(key);
+      const { tier, capacity, expires } = this.keySettings(options, key);
+      if (tier !== key.tier || capacity !== key.stamina_capacity)
+        assert(key.reserved === 0 && key.stamina_reserved === 0 && !this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1").get(id), '请等待该密钥请求结束，再修改等级或体力上限', 409);
       assert(options.enabled === undefined || typeof options.enabled === 'boolean', '状态无效');
-      this.db.prepare('UPDATE keys SET name=?,tier=?,nai5_upstream_id=?,expires_at=?,enabled=? WHERE id=?')
-        .run(options.name === undefined ? key.name : this.recordName(options.name, 'keys'), tier, binding, expires, options.enabled === undefined ? key.enabled : Number(options.enabled), id);
+      const stamina = tier !== key.tier ? dailyFor(capacity) : Math.min(capacity,key.stamina_balance);
+      this.db.prepare('UPDATE keys SET name=?,tier=?,expires_at=?,enabled=?,stamina_capacity=?,stamina_balance=?,stamina_refill_period=? WHERE id=?')
+        .run(options.name === undefined ? key.name : this.recordName(options.name,'keys'),tier,expires,options.enabled === undefined ? key.enabled : Number(options.enabled),capacity,stamina,Math.max(refillPeriod(key.created_at),key.stamina_refill_period),id);
     });
   }
   retireKey(id) {
     this.transaction(() => {
       const key = this.key(id); assert(key, '密钥不存在', 404);
-      assert(key.reserved === 0 && !this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1").get(id),
+      assert(key.reserved === 0 && key.stamina_reserved === 0 && !this.db.prepare("SELECT id FROM jobs WHERE key_id=? AND status='running' LIMIT 1").get(id),
         '请等待该密钥的生成和排队结束，再删除密钥', 409);
       // Keep the row for historical job and ledger references; erase the recoverable credential.
       this.db.prepare("UPDATE keys SET enabled=0,retired_at=?,token_encrypted='' WHERE id=?").run(Date.now(), id);
@@ -220,15 +208,18 @@ export class Store {
       this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, delta, 'adjust', note, Date.now());
     });
   }
-  reserve(keyId, id, endpoint, model, amount, idempotency, upstreamId, { mode = 'pool', upstreamEstimate = 0 } = {}) {
+  reserve(keyId, id, endpoint, model, amount, idempotency, upstreamId, { mode = 'pool', upstreamEstimate = 0, stamina = 0 } = {}) {
     this.transaction(() => {
       const key = this.usableKey(keyId); integer(amount, 0, 1_000_000_000);
       assert(key.balance - key.reserved >= amount, `Anlas 不足，本次需要预留 ${amount} Anlas`, 402);
+      integer(stamina,0,100,'预留体力');
+      assert(stamina === 0 || key.tier === 'member' && stamina === 100, '体力预留无效');
+      assert(availableStamina(key) >= stamina, '本地体力不足，请重新查询额度', 409);
       const selected = this.upstream(upstreamId ?? -1);
       assert(selected?.enabled, '选定上游已停用，请重新查询额度', 409);
       if (idempotency) assert(!this.db.prepare('SELECT id FROM jobs WHERE key_id=? AND idempotency=?').get(keyId, idempotency), '该请求已受理，请勿重复提交', 409);
-      this.db.prepare("INSERT INTO jobs(id,key_id,endpoint,model,status,reserved,created_at,idempotency,upstream_id,upstream_name,tier_snapshot,route_mode,upstream_estimate) VALUES(?,?,?,?,'running',?,?,?,?,?,?,?,?)").run(id, keyId, endpoint, model, amount, Date.now(), idempotency, upstreamId, selected.name, key.tier, mode, upstreamEstimate);
-      this.db.prepare('UPDATE keys SET reserved=reserved+?,last_used_at=? WHERE id=?').run(amount, Date.now(), keyId);
+      this.db.prepare("INSERT INTO jobs(id,key_id,endpoint,model,status,reserved,created_at,idempotency,upstream_id,upstream_name,tier_snapshot,route_mode,upstream_estimate,stamina_reserved) VALUES(?,?,?,?,'running',?,?,?,?,?,?,?,?,?)").run(id,keyId,endpoint,model,amount,Date.now(),idempotency,upstreamId,selected.name,key.tier,mode,upstreamEstimate,stamina);
+      this.db.prepare('UPDATE keys SET reserved=reserved+?,stamina_reserved=stamina_reserved+?,last_used_at=? WHERE id=?').run(amount,stamina,Date.now(),keyId);
     });
   }
   settle(id, charged, status, note, http = null) {
@@ -237,8 +228,9 @@ export class Store {
       assert(job?.status === 'running', '任务已经结算或不存在', 409);
       assert(['completed', 'failed'].includes(status), '任务只能按成功或失败结算');
       assert(charged === (status === 'completed' ? job.reserved : 0), '成功按本地报价结算，失败释放全部预留');
-      this.db.prepare('UPDATE keys SET reserved=reserved-?,balance=balance-? WHERE id=?').run(job.reserved, charged, job.key_id);
-      this.db.prepare('UPDATE jobs SET status=?,charged=?,upstream_spent=?,http_status=?,note=?,finished_at=? WHERE id=?').run(status, charged, status === 'completed' ? job.upstream_estimate : 0, http, note, Date.now(), id);
+      const staminaCharged = status === 'completed' ? job.stamina_reserved : 0;
+      this.db.prepare('UPDATE keys SET reserved=reserved-?,balance=balance-?,stamina_reserved=stamina_reserved-?,stamina_balance=stamina_balance-? WHERE id=?').run(job.reserved,charged,job.stamina_reserved,staminaCharged,job.key_id);
+      this.db.prepare('UPDATE jobs SET status=?,charged=?,upstream_spent=?,http_status=?,note=?,finished_at=?,stamina_charged=? WHERE id=?').run(status,charged,status === 'completed' ? job.upstream_estimate : 0,http,note,Date.now(),staminaCharged,id);
       this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,job_id,created_at) VALUES(?,?,?,?,?,?)').run(job.key_id, -charged, 'usage', note, id, Date.now());
     });
   }

@@ -18,12 +18,12 @@ for (const row of fixtures) {
 if (!app.store.keys().length) {
   const rows=app.store.upstreams();
   const keys = [['小樱的创作空间',3600],['花见 · 插画工作室',8200],['周末的灵感',1400],['个人测试',300]].map(([name,points],i) =>
-    app.store.createKey(name,points,i<2 ? {tier:'member',upstreamId:rows[i].id,validDays:30} : {tier:'standard',expiresAt:i===2 ? Date.now()-86400000 : null}));
+    app.store.createKey(name,points,i<2 ? {tier:'member',staminaPercent:i===0?25:100,validDays:30} : {tier:'standard',expiresAt:i===2 ? Date.now()-86400000 : null}));
   app.store.db.prepare('UPDATE keys SET enabled=0 WHERE id=?').run(keys[3].id);
   for (let i=0;i<21;i++) {
     const id=`preview-request-${i}`, kid=keys[i%3].id, cost=[12,26,30,0,8,26,14][i%7];
     const expiry=app.store.key(kid).expires_at;app.store.updateKey(kid,{expiresAt:null});
-    app.store.reserve(kid,id,'/ai/generate-image','nai-diffusion-5-full',cost,null,app.store.upstreams()[i%2].id,{mode:i%3===2?'pool':cost?'anlas-pool':'nai5-bound',upstreamEstimate:0});
+    app.store.reserve(kid,id,'/ai/generate-image','nai-diffusion-5-full',cost,null,app.store.upstreams()[i%2].id,{mode:i%3===2?'pool':cost?'anlas-pool':'nai5-local-stamina',upstreamEstimate:0});
     app.store.updateKey(kid,{expiresAt:expiry});
     app.store.settle(id,cost,'completed',cost?'按密钥等级本地计价':'会员免费权益，未扣点数',200);
     const timestamp=Date.now()-((20-i)%7)*86400000-i*60000;

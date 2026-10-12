@@ -1,5 +1,6 @@
 import { assert, integer } from './security.mjs';
 import { estimateCost, augmentCost, upscaleCost, active } from './cost.mjs';
+import { localUsage, hasLocalStamina, IMAGE_STAMINA, dailyFor, availableStamina, staminaPercent } from './stamina.mjs';
 
 const models = new Set(['nai-diffusion-3', 'nai-diffusion-furry-3', 'nai-diffusion-4-full', 'nai-diffusion-4-curated-preview', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated', 'nai-diffusion-5-full', 'nai-diffusion-5-curated']);
 export function balanceOf(subscription) {
@@ -31,19 +32,20 @@ export const isActiveOpus = data => active(data) && data?.tier === 3;
 export function hasNai5Allowance(data) {
   return isActiveOpus(data) && Number.isFinite(data?.usage?.percent) && data.usage.percent > 0 && data.usage.isNegative === false;
 }
-export function billingAccount(key, boundSubscription = null) {
+export function billingAccount(key) {
   return { tier: key.tier === 'member' ? 3 : 1, active: true,
-    usage: key.tier === 'member' && hasNai5Allowance(boundSubscription)
-      ? { percent: boundSubscription.usage.percent, isNegative: false } : emptyUsage() };
+    usage: localUsage(key) };
 }
-export function downstreamSubscription(key, boundSubscription = null) {
-  const account = billingAccount(key, boundSubscription);
+export function downstreamSubscription(key) {
+  const account = billingAccount(key);
   return { ...account,
     ...(key.expires_at !== null ? { expiresAt: key.expires_at / 1000 } : {}),
     trainingStepsLeft: { fixedTrainingStepsLeft: key.balance - key.reserved, purchasedTrainingSteps: 0 },
     relay: { tier: key.tier, expiresAt: key.expires_at, balance: key.balance, reserved: key.reserved,
       available: key.balance - key.reserved, unit: 'Anlas', billing: 'local',
-      nai5UpstreamId: key.nai5_upstream_id, usageSource: key.tier === 'member' ? 'bound-upstream' : 'none' } };
+      usageSource: key.tier === 'member' ? 'local' : 'none',
+      stamina: { capacityPercent: staminaPercent(key.stamina_capacity ?? 0), availableImages: Math.floor(availableStamina(key) / IMAGE_STAMINA),
+        capacityImages: (key.stamina_capacity ?? 0) / IMAGE_STAMINA, dailyImages: dailyFor(key.stamina_capacity ?? 0) / IMAGE_STAMINA } } };
 }
 export const isNai5Generation = (path, body) => ['/ai/generate-image', '/ai/generate-image-stream'].includes(path) && /^nai-diffusion-5-(full|curated)(-inpainting)?$/.test(body.model);
 function dimensions(p) {
@@ -60,7 +62,7 @@ function referenceCount(parameters, field) {
 }
 
 /** Authoritative local price. Upstream routing uses the same formula with the real account. */
-export function reservation(path, body, subscription) {
+export function reservation(path, body, subscription, details = false) {
   if (path === '/ai/encode-vibe') {
     assert(typeof body.image === 'string' && body.image.length > 0 && models.has(body.model) && body.model.startsWith('nai-diffusion-4'), 'Vibe 编码参数无效');
     return 2;
@@ -112,7 +114,16 @@ export function reservation(path, body, subscription) {
     directorReference: Array(director), vibe: Array(vibes),
   }, subscription);
   assert(estimate.valid, '单张消耗不能超过 140 Anlas');
-  return estimate.total;
+  return details ? estimate : estimate.total;
+}
+
+export function quoteRequest(path, body, key) {
+  const account = billingAccount(key);
+  if (isNai5Generation(path, body)) {
+    const estimate = reservation(path, body, account, true);
+    return { amount: estimate.total, stamina: hasLocalStamina(key) && estimate.usesAllowance ? IMAGE_STAMINA : 0 };
+  }
+  return { amount: reservation(path, body, account), stamina: 0 };
 }
 
 /** Validate upstream SSE before settlement; optionally expose parsed events to a client encoder. */

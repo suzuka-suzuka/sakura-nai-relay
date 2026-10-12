@@ -34,39 +34,13 @@ test('自动名称跳过已占用编号，改名、删除和重启后仍继续�
   }
 });
 
-test('独享字段迁移默认共享，保留绑定、余额和历史，重启后保留独享设置',()=>{
-  const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-'));let store;
-  try {
-    store=new Store(directory); store.setUpstream('pst-exclusive-migration');
-    const member=store.createKey('原有绑定',88,{tier:'member',upstreamId:1,validDays:30});
-    store.reserve(member.id,'exclusive-history','/ai/generate-image','nai-diffusion-5-full',26,null,1);
-    store.settle('exclusive-history',26,'completed','保留历史',200);
-    const key={...store.key(member.id)},ledger=store.ledger(),jobs=store.jobs();
-    store.db.exec('ALTER TABLE upstreams DROP COLUMN exclusive');
-    store.close();store=new Store(directory);
-    assert.equal(store.upstream(1).exclusive,0); assert.deepEqual({...store.key(member.id)},key);
-    assert.deepEqual(store.ledger(),ledger); assert.deepEqual(store.jobs(),jobs);
-    assert.equal(store.upstreamToken(1),'pst-exclusive-migration');
-    store.updateUpstream(1,{enabled:true,exclusive:true});
-    store.close();store=new Store(directory);
-    assert.equal(store.upstream(1).exclusive,1); assert.equal(store.upstreams()[0].bound_keys,1);
-    assert.deepEqual({...store.key(member.id)},key); assert.deepEqual(store.revealKey(member.id),member);
-    assert.throws(()=>store.createKey('不能重复绑定',0,{tier:'member',upstreamId:1}),/只能绑定一个/);
-    assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(),[]);
-  } finally {
-    store?.close();
-    assert.ok(resolve(directory).startsWith(resolve(tmpdir())+'\\sakura-schema-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/sakura-schema-test-'));
-    rmSync(directory,{recursive:true,force:true});
-  }
-});
-
-test('删除账号权重保留密钥、绑定和流水，原权重零转为停用且只迁移一次',()=>{
+test('删除账号权重保留密钥、体力和流水，原权重零转为停用且只迁移一次',()=>{
   const directory=mkdtempSync(join(tmpdir(),'sakura-schema-test-'));let store;
   try {
     store=new Store(directory);store.set('admin_password','preserved-password-hash');
     for(const [name,token,enabled] of [['正常','pst-active',true],['旧暂停','pst-paused',true],['旧停用','pst-disabled',false]])
       store.addUpstream({name,token,enabled});
-    const member=store.createKey('绑定保留',88,{tier:'member',upstreamId:2,validDays:30});
+    const member=store.createKey('体力保留',88,{tier:'member',validDays:30});
     const standard=store.createKey('历史保留',100);
     store.reserve(standard.id,'preserved-job','/ai/generate-image','nai-diffusion-5-full',26,null,1,{upstreamEstimate:26});
     store.settle('preserved-job',26,'completed','原有成功任务',200);
@@ -75,7 +49,7 @@ test('删除账号权重保留密钥、绑定和流水，原权重零转为停�
     assert.ok(!store.db.prepare('PRAGMA table_info(upstreams)').all().some(c=>c.name==='weight'));
     assert.deepEqual(store.upstreams().map(u=>u.enabled),[1,0,0]);
     assert.equal(store.upstreamToken(2),'pst-paused');assert.deepEqual(store.revealKey(member.id),member);
-    assert.equal(store.key(member.id).nai5_upstream_id,2);assert.equal(store.key(member.id).balance,88);
+    assert.equal(store.key(member.id).nai5_upstream_id,undefined);assert.equal(store.key(member.id).balance,88);
     assert.equal(store.key(standard.id).balance,74);assert.equal(store.jobs()[0].charged,26);
     assert.equal(store.jobs()[0].upstream_spent,26);assert.equal(store.get('admin_password'),'preserved-password-hash');
     assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(),[]);
@@ -89,12 +63,12 @@ test('删除账号权重保留密钥、绑定和流水，原权重零转为停�
   }
 });
 
-test('增加密钥删除标记保留现有密钥与流水，删除后重启不会恢复凭据或绑定', () => {
+test('增加密钥删除标记保留现有密钥与流水，删除后重启不会恢复凭据', () => {
   const directory = mkdtempSync(join(tmpdir(), 'sakura-schema-test-')); let store;
   try {
     store = new Store(directory); store.setUpstream('pst-migration-test');
     const active = store.createKey('保留密钥', 100);
-    const member = store.createKey('待删除会员', 88, { tier: 'member', upstreamId: 1, validDays: 30 });
+    const member = store.createKey('待删除会员', 88, { tier: 'member', validDays: 30 });
     store.reserve(member.id, 'delete-history', '/ai/generate-image', 'nai-diffusion-5-full', 26, null, 1);
     store.settle('delete-history', 26, 'completed', '保留历史', 200);
     const expires = store.key(member.id).expires_at, ledger = store.ledger();
@@ -102,7 +76,7 @@ test('增加密钥删除标记保留现有密钥与流水，删除后重启不�
     store.close(); store = new Store(directory);
     assert.deepEqual(store.revealKey(active.id), active); assert.deepEqual(store.revealKey(member.id), member);
     assert.equal(store.key(member.id).expires_at, expires); assert.equal(store.key(member.id).balance, 62);
-    assert.equal(store.upstreams()[0].bound_keys, 1); assert.deepEqual(store.ledger(), ledger);
+    assert.equal(store.upstreams()[0].bound_keys, undefined); assert.deepEqual(store.ledger(), ledger);
     store.retireKey(member.id); store.retireUpstream(1);
     store.close(); store = new Store(directory);
     assert.equal(store.authenticate(member.token), null); assert.equal(store.key(member.id), undefined);
@@ -147,10 +121,10 @@ test('升级使旧 Key 失效并归档旧流水，保留管理员和上游，重
     assert.equal(store.db.prepare('SELECT delta FROM archived_ledger').get().delta,-26);
     assert.equal(store.db.prepare('SELECT name FROM archived_keys').get().name,'旧用户');
     assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(),[]);
-    const key=store.createKey('新会员',88,{tier:'member',upstreamId:1,validDays:30});const expires=store.key(key.id).expires_at;
+    const key=store.createKey('新会员',88,{tier:'member',validDays:30});const expires=store.key(key.id).expires_at;
     store.close();store=new Store(directory);
     assert.equal(store.authenticate(key.token).balance,88);assert.equal(store.key(key.id).expires_at,expires);
-    assert.deepEqual(store.revealKey(key.id),key);assert.equal(store.key(key.id).nai5_upstream_id,1);
+    assert.deepEqual(store.revealKey(key.id),key);assert.equal(store.key(key.id).nai5_upstream_id,undefined);
     assert.equal(store.authenticate(token),null);
   } finally {
     db?.close();store?.close();

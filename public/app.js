@@ -93,6 +93,8 @@ function shell() {
 function quotaFor(id) { return state.quota?.upstreams.find(q => q.id === id); }
 function remaining(q) { const u = q?.account?.usage; return u ? u.isNegative ? 0 : Math.max(0, Math.min(100, u.percent)) : null; }
 const tierName = tier => tier === 'member' ? '会员' : '普通';
+const staminaPct = units => (Math.round((units ?? 0) / 112000 * 1000) / 10).toFixed(1);
+const staminaText = k => k.tier === 'member' ? staminaPct(k.stamina_balance-k.stamina_reserved)+'% / '+staminaPct(k.stamina_capacity)+'%' : '0.0%';
 const expiresText = value => value === null ? '永久有效' : new Date(value).toLocaleString('zh-CN', { hour12: false });
 const expired = key => key.expires_at !== null && key.expires_at <= Date.now();
 const keyStatus = key => !key.enabled ? '已停用' : expired(key) ? '已过期' : '已启用';
@@ -102,7 +104,7 @@ function keyForm(id) {
   modal(k ? '编辑访问密钥' : '创建访问密钥', `<form id="key-form" data-id="${k?.id ?? ''}">
     <label>名称<input name="name" value="${e(k?.name ?? '')}" maxlength="64" autofocus></label>
     <label>密钥等级<select name="tier" aria-label="密钥等级"><option value="standard" ${k?.tier === 'standard' ? 'selected' : ''}>普通 · 按点数使用</option><option value="member" ${!k || k.tier === 'member' ? 'selected' : ''}>会员 · Opus 计费权益</option></select></label>
-    ${k ? `<div data-member-fields><label>NAI5 绑定上游<select name="upstreamId" aria-label="NAI5 绑定上游"><option value="">请选择上游</option>${state.data.upstreams.map(u => `<option value="${u.id}" ${k.nai5_upstream_id === u.id ? 'selected' : ''} ${u.exclusive && u.bound_keys > 0 && k.nai5_upstream_id !== u.id ? 'disabled' : ''}>${e(u.name)}${u.exclusive ? '（独享）' : ''}${!u.enabled ? '（已停用）' : ''}</option>`).join('')}</select></label></div>` : ''}
+    <div data-member-fields><label>体力上限（%）<input name="staminaPercent" type="number" min="1" max="100" step="1" value="${k?.tier === 'member' ? k.stamina_capacity / 1120 : 25}"></label></div>
     ${k ? '' : '<label>初始点数（Anlas）<input name="points" type="number" min="0" max="1000000000" step="1" value="0" required></label>'}
     <label>有效期<select name="expiryMode" aria-label="有效期">${k ? '<option value="keep" selected>保持当前有效期</option>' : ''}<option value="never">永久有效</option><option value="days" ${k ? '' : 'selected'}>${k ? '按天数续期' : '按天数设置'}</option><option value="date">指定到期时间</option></select></label>
     ${k ? `<p class="field-note">当前：${e(expiresText(k.expires_at))}</p>` : ''}
@@ -115,7 +117,7 @@ function syncKeyForm() {
   const f = $('#key-form'); if (!f) return;
   const member = f.elements.tier.value === 'member', mode = f.elements.expiryMode.value;
   const memberFields = $('[data-member-fields]', f);
-  if (memberFields) { memberFields.hidden = !member; f.elements.upstreamId.required = member; }
+  if (memberFields) { memberFields.hidden = !member; f.elements.staminaPercent.required = member; f.elements.staminaPercent.disabled = !member; }
   $('[data-expiry-days]', f).hidden = mode !== 'days'; f.elements.validDays.required = mode === 'days';
   $('[data-expiry-date]', f).hidden = mode !== 'date'; f.elements.expiresAt.required = mode === 'date';
 }
@@ -131,12 +133,12 @@ function upstreamCards() {
   const rows = state.data.upstreams;
   return rows.length ? rows.map(row => {
     const q = quotaFor(row.id), pct = remaining(q);
-    return `<article class="upstream-card"><div class="upstream-card-head"><span class="upstream-mark">N</span><div class="upstream-card-name"><h3>${e(row.name)}${row.exclusive ? ' <span class="badge pink">独享</span>' : ''}</h3><code>•••• ${e(row.suffix)}</code></div>${upstreamBadge(row)}</div><div class="upstream-metrics"><div><span>账户余额</span><strong>${q?.ok ? number(q.account.relay.balance) : '—'}<small>Anlas</small></strong></div><div><span>排队请求</span><strong>${number(row.queued ?? 0)}</strong></div></div><div class="quota-row"><span>NAI5 剩余额度</span><b>${pct === null ? '—' : pct.toFixed(1) + '%'}</b></div><div class="progress-track"><div style="width:${pct ?? 0}%"></div></div>${row.error || q && !q.ok ? '<p class="field-note">'+e(row.error || q.error)+'</p>' : ''}<p class="field-note">${q?.ok ? e(({0:"无订阅",1:"Tablet",2:"Scroll",3:"Opus"})[q.account.tier] ?? "其他套餐") : "套餐待查询"} · 绑定 ${row.bound_keys ?? 0} 个会员${q?.ok && q.account.expiresAt ? " · 到期 " + e(expiresText(q.account.expiresAt * 1000)) : ""}</p><div class="upstream-card-actions"><button class="button small subtle" data-action="edit-upstream" data-id="${row.id}">编辑上游</button><button class="button small text-button" data-action="toggle-upstream" data-id="${row.id}">${row.enabled ? '停用' : '启用'}</button></div></article>`;
+    return `<article class="upstream-card"><div class="upstream-card-head"><span class="upstream-mark">N</span><div class="upstream-card-name"><h3>${e(row.name)}</h3><code>•••• ${e(row.suffix)}</code></div>${upstreamBadge(row)}</div><div class="upstream-metrics"><div><span>账户余额</span><strong>${q?.ok ? number(q.account.relay.balance) : '—'}<small>Anlas</small></strong></div><div><span>排队请求</span><strong>${number(row.queued ?? 0)}</strong></div></div><div class="quota-row"><span>NAI5 剩余额度</span><b>${pct === null ? '—' : pct.toFixed(1) + '%'}</b></div><div class="progress-track"><div style="width:${pct ?? 0}%"></div></div>${row.error || q && !q.ok ? '<p class="field-note">'+e(row.error || q.error)+'</p>' : ''}<p class="field-note">${q?.ok ? e(({0:"无订阅",1:"Tablet",2:"Scroll",3:"Opus"})[q.account.tier] ?? "其他套餐") : "套餐待查询"}${q?.ok && q.account.expiresAt ? " · 到期 " + e(expiresText(q.account.expiresAt * 1000)) : ""}</p><div class="upstream-card-actions"><button class="button small subtle" data-action="edit-upstream" data-id="${row.id}">编辑上游</button><button class="button small text-button" data-action="toggle-upstream" data-id="${row.id}">${row.enabled ? '停用' : '启用'}</button></div></article>`;
   }).join('') : empty('暂无上游', '', '<button class="button subtle" data-action="add-upstream">添加上游</button>');
 }
 function editUpstream(id) {
   const row = state.data.upstreams.find(u => u.id === Number(id));
-  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" maxlength="64" autofocus></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="toggle-row"><strong>独享 Key</strong><label class="switch"><input name="exclusive" type="checkbox" ${row?.exclusive ? 'checked' : ''} aria-label="独享 Key"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
+  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" maxlength="64" autofocus></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
 }
 function usageChart(days, metric, title, unit) {
   const max = Math.max(1, ...days.map(day => day[metric] ?? 0));
@@ -170,11 +172,11 @@ function keyTable(keys) {
     if (!keys.length) return empty('没有匹配的密钥', '');
   }
   if (!keys.length) return empty('暂无访问密钥', '', '<button class="button subtle" data-action="create">创建密钥</button>');
-  return '<div class="table-scroll"><table><thead><tr><th>密钥 / 等级</th><th>状态 / 到期</th><th>可用点数</th><th>NAI5 上游</th><th class="right">管理</th></tr></thead><tbody>' + keys.map(k =>
+  return '<div class="table-scroll"><table><thead><tr><th>密钥 / 等级</th><th>状态 / 到期</th><th>可用点数</th><th>V5 体力</th><th class="right">管理</th></tr></thead><tbody>' + keys.map(k =>
     '<tr><td><div class="key-cell"><span class="key-avatar">'+icon('key')+'</span><div><strong>'+e(k.name)+'</strong><code>'+e(k.prefix)+'</code><small class="cell-note">'+tierName(k.tier)+'</small></div></div></td>'+
     '<td><span class="badge '+(k.enabled && !expired(k) ? 'green' : 'muted')+'"><i></i>'+keyStatus(k)+'</span><small class="cell-note">'+e(expiresText(k.expires_at))+'</small></td>'+
     '<td><span class="point-value">'+number(k.balance-k.reserved)+'</span><small class="cell-note">'+(k.reserved ? '预留 '+number(k.reserved)+' Anlas' : 'Anlas')+'</small></td>'+
-    '<td>'+e(k.tier === 'member' ? k.upstream_name : '账号池')+'<small class="cell-note">'+(k.tier === 'member' ? '共享体力 · 耗尽后按点数' : 'NAI5 体力 0%')+'</small></td>'+
+    '<td>'+staminaText(k)+'<small class="cell-note">'+(k.tier === 'member' ? Math.floor((k.stamina_balance-k.stamina_reserved)/100)+' / '+(k.stamina_capacity/100)+' 张' : '按点数使用')+'</small></td>'+
     '<td class="right"><button class="button small subtle" data-action="points" data-id="'+k.id+'">调整点数</button><button class="button small subtle" data-action="edit-key" data-id="'+k.id+'">编辑</button><button class="button small subtle" data-action="key-detail" data-id="'+k.id+'">查看密钥</button><button class="button small danger" data-action="remove-key" data-id="'+k.id+'">删除</button></td></tr>'
   ).join('')+'</tbody></table></div>';
 }
@@ -229,7 +231,7 @@ async function detail(id) {
   const k = state.data.keys.find(k => k.id === Number(id)); if (!k) return;
   const { token } = await api('/keys/'+k.id+'/reveal', { method: 'POST', body: {} });
   modal(k.name, '<code id="new-token" class="token-display">'+e(token)+'</code><dl class="details">'+
-    '<dt>等级</dt><dd>'+tierName(k.tier)+'</dd><dt>NAI5 上游</dt><dd>'+e(k.tier === 'member' ? k.upstream_name : '账号池 · 体力返回 0%')+'</dd>'+
+    '<dt>等级</dt><dd>'+tierName(k.tier)+'</dd><dt>本地体力</dt><dd>'+staminaText(k)+'</dd>'+
     '<dt>有效期</dt><dd>'+e(expiresText(k.expires_at))+'</dd><dt>创建时间</dt><dd>'+date(k.created_at)+'</dd>'+
     '<dt>当前余额</dt><dd>'+number(k.balance)+' Anlas</dd><dt>预留点数</dt><dd>'+number(k.reserved)+' Anlas</dd>'+
     '<dt>状态</dt><dd>'+keyStatus(k)+'</dd></dl><div class="modal-actions key-actions">'+
@@ -244,13 +246,13 @@ function removeKey(id) {
 }
 function jobDetail(id) {
   const j = state.data.jobs.find(j => j.id === id); if (!j) return;
-  const mode = ({pool:'账号池', 'opus-pool':'Opus 免费池', 'anlas-pool':'Anlas 余额池', 'nai5-bound':'会员绑定上游', 'nai5-paid-pool':'NAI5 体力耗尽 · Anlas 池', 'nai5-stamina-pool':'NAI5 体力池 · 下游扣点'})[j.route_mode];
+  const mode = ({pool:'账号池', 'opus-pool':'Opus 免费池', 'anlas-pool':'Anlas 余额池', 'nai5-local-stamina':'V5 本地体力池', 'nai5-bound':'旧会员绑定上游', 'nai5-paid-pool':'NAI5 体力耗尽 · Anlas 池', 'nai5-stamina-pool':'NAI5 体力池 · 下游扣点'})[j.route_mode];
   modal('请求详情', '<dl class="details"><dt>请求编号</dt><dd><code>'+e(j.id)+'</code></dd>'+
     '<dt>访问密钥</dt><dd>'+e(j.key_name)+'</dd><dt>计费等级</dt><dd>'+tierName(j.tier_snapshot)+'</dd>'+
     '<dt>所用上游</dt><dd>'+e(j.upstream_name)+'</dd><dt>路由方式</dt><dd>'+e(mode)+'</dd>'+
     '<dt>状态</dt><dd>'+badge(j.status)+'</dd><dt>本地报价</dt><dd>'+number(j.reserved)+' Anlas</dd>'+
     '<dt>上游消耗</dt><dd>'+number(j.upstream_spent)+' Anlas</dd>'+
-    '<dt>实际扣点</dt><dd>'+(j.charged === null ? '处理中' : number(j.charged)+' Anlas')+'</dd></dl><p class="info-box">'+e(j.note)+'</p>'+
+    '<dt>体力消耗</dt><dd>'+(j.stamina_charged === null ? '—' : number(j.stamina_charged/100)+' 张')+'</dd><dt>实际扣点</dt><dd>'+(j.charged === null ? '处理中' : number(j.charged)+' Anlas')+'</dd></dl><p class="info-box">'+e(j.note)+'</p>'+
     '<div class="modal-actions"><button class="button subtle" data-action="close">关闭</button></div>');
 }
 
@@ -262,7 +264,7 @@ document.addEventListener('click', async event => {
   if (action === 'edit-key') return keyForm(id);
   if (action === 'remove-key') return removeKey(id);
   if (action === 'add-upstream' || action === 'edit-upstream') return editUpstream(id);
-  if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。已绑定会员将自动换绑到 NAI5 剩余额度最高的可用上游；没有可换绑账号时保留原上游。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
+  if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。下游本地体力和点数不受影响。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
   if (action === 'points') return points(id);
   if (action === 'key-detail') return withButton(button, () => detail(id));
   if (action === 'job') return jobDetail(id);
@@ -272,7 +274,7 @@ document.addEventListener('click', async event => {
     if (action === 'refresh') { await refresh(); if (state.data.settings.configured) await quota(); }
     if (action === 'quota') await quota();
     if (action === 'toggle-upstream') { const row = state.data.upstreams.find(u => u.id === Number(id)); await api('/upstreams/'+id, { method:'PUT', body:{ name:row.name, enabled:!row.enabled } }); await refresh(); toast(row.enabled ? '上游已停用' : '上游已启用'); }
-    if (action === 'confirm-remove-upstream') { const result = await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast(result.reboundKeys ? `上游已移除，${result.reboundKeys} 个会员已自动换绑` : '上游已移除'); }
+    if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
     if (action === 'confirm-remove-key') { await api('/keys/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('密钥已删除，历史记录已保留'); }
     if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
     if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }
@@ -299,7 +301,7 @@ document.addEventListener('submit', async event => {
       }
       if (form.id === 'key-form') {
         const body = { name: values.name, tier: values.tier };
-        if (form.dataset.id) body.upstreamId = values.tier === 'member' ? Number(values.upstreamId) : null;
+        if (values.tier === 'member') body.staminaPercent = Number(values.staminaPercent);
         if (values.expiryMode === 'never') body.expiresAt = null;
         if (values.expiryMode === 'days') body.validDays = Number(values.validDays);
         if (values.expiryMode === 'date') body.expiresAt = new Date(values.expiresAt).getTime();
@@ -310,7 +312,7 @@ document.addEventListener('submit', async event => {
         modal('密钥已创建', `<div class="success-mark">${icon('check')}</div><code id="new-token" class="token-display">${e(result.token)}</code><div class="key-connect"><span>连接地址</span><code>${e(state.data.relayUrl)}</code></div><div class="modal-actions"><button class="button subtle" data-action="close">关闭</button><button class="button primary" data-action="copy-key">${icon('copy')}复制密钥</button></div>`);
       }
       if (form.id === 'points-form') { await api(`/keys/${form.dataset.id}/points`, { method: 'POST', body: { delta: Number(values.delta), note: values.note } }); closeModal(); await refresh(); toast('Anlas 已调整，流水已记录'); }
-      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on', exclusive:values.exclusive === 'on'}}); closeModal(); await refresh(); await quota(); toast('上游已保存'); }
+      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); await quota(); toast('上游已保存'); }
       if (form.id === 'settings-form') {
         await api('/settings', { method: 'PUT', body: { enabled: values.enabled === 'on', origins: values.origins.split('\n').map(x => x.trim()).filter(Boolean) } }); await refresh(); await quota(); toast('设置已保存');
       }

@@ -33,8 +33,8 @@ export class UpstreamRouter {
   }
   assertAvailable(id) {
     const row = this.store.upstream(id);
-    assert(row?.enabled, '绑定或选定上游已停用或移除', 503);
-    assert(!(this.cooldowns.get(id)?.until > Date.now()), '绑定或选定上游正在冷却，请稍后重试', 503);
+    assert(row?.enabled, '选定上游已停用或移除', 503);
+    assert(!(this.cooldowns.get(id)?.until > Date.now()), '选定上游正在冷却，请稍后重试', 503);
     return row;
   }
   async lockKey(id, signal) {
