@@ -183,7 +183,7 @@ export class Store {
       const { tier, capacity, expires } = this.keySettings(options);
       name = this.recordName(name ?? '', 'keys');
       const result = this.db.prepare(`INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,expires_at,stamina_capacity,stamina_balance,stamina_refill_period)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,dailyFor(capacity),0);
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,capacity,0);
       const id = Number(result.lastInsertRowid);
       if (balance !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
       return { id, token };

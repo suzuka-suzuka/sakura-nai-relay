@@ -20,7 +20,7 @@ function fixture(t) {
 test('零点创建和调整不写流水，分配、充值与人工扣点保留，失败调整不影响余额或流水', t => {
   const { store } = fixture(t);
   const empty = store.createKey('零点会员', 0, { tier: 'member' });
-  assert.equal(store.key(empty.id).stamina_balance, 4000);
+  assert.equal(store.key(empty.id).stamina_balance, 28000);
   assert.deepEqual(store.ledger(), []);
   store.adjust(empty.id, 0, '零点调整');
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM ledger').get().count, 0);
@@ -40,20 +40,20 @@ test('免费体力生成和失败请求保留任务但不写流水，实际扣�
   const reserve = (id, amount, stamina = 0) => store.reserve(key.id, id, '/ai/generate-image', 'nai-diffusion-5-full', amount, id, upstream, { stamina });
   reserve('free', 0, 100);
   store.settle('free', 0, 'completed', '免费生成', 200);
-  assert.equal(store.key(key.id).stamina_balance, 3900);
+  assert.equal(store.key(key.id).stamina_balance, 27900);
   assert.equal(store.jobs()[0].stamina_charged, 100);
   assert.deepEqual(store.ledger(), initial);
   reserve('failed', 26, 100);
   store.fail('failed', '上游失败', 500);
   assert.equal(store.key(key.id).balance, 100);
-  assert.equal(store.key(key.id).stamina_balance, 3900);
+  assert.equal(store.key(key.id).stamina_balance, 27900);
   assert.equal(store.key(key.id).reserved, 0);
   assert.equal(store.key(key.id).stamina_reserved, 0);
   assert.deepEqual(store.ledger(), initial);
   reserve('paid', 26, 100);
   store.settle('paid', 26, 'completed', '批量额外扣点', 200);
   assert.equal(store.key(key.id).balance, 74);
-  assert.equal(store.key(key.id).stamina_balance, 3800);
+  assert.equal(store.key(key.id).stamina_balance, 27800);
   assert.deepEqual(store.ledger().map(row => [row.kind, row.delta, row.job_id]), [['usage', -26, 'paid'], ['grant', 100, null]]);
   assert.equal(store.jobs().length, 3);
   assert.throws(() => store.settle('paid', 26, 'completed', '重复结算', 200), /已经结算/);

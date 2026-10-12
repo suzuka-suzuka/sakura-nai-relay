@@ -438,7 +438,7 @@ test('名称省略、留空或仅含空白时自动递增命名，会员可用�
     assert.equal(res.status, 201);
     const created = await res.json(), key = f.app.store.key(created.id);
     assert.equal(key.name, `下游-Key-${index + 1}`); assert.equal(key.tier, 'member');
-    assert.equal(key.balance, 0); assert.equal(key.nai5_upstream_id, undefined); assert.equal(key.stamina_balance,4000);
+    assert.equal(key.balance, 0); assert.equal(key.nai5_upstream_id, undefined); assert.equal(key.stamina_balance,28000);
     assert.ok(key.expires_at >= before + 30 * 86400000 && key.expires_at <= Date.now() + 30 * 86400000);
   }
   assert.equal((await f.call(`/admin/api/keys/${f.key.id}`, 'POST', { name: '  ' })).status, 200);
@@ -917,8 +917,9 @@ async function waitFor(check) {
 
 test('会员无需绑定或上游即可创建，体力上限校验且普通 Key 不分配体力',async t=>{
  const f=await fixture(t);assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);f.mock.state.calls=[];
- for(const staminaPercent of [25,100]){const res=await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent});assert.equal(res.status,201);
- const key=f.app.store.key((await res.json()).id);assert.equal(key.stamina_balance,staminaPercent*160);assert.equal(key.stamina_capacity,staminaPercent*1120);assert.equal(key.nai5_upstream_id,undefined);}
+ for(const staminaPercent of [1,25,37,100]){const res=await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent});assert.equal(res.status,201);
+ const created=await res.json(),key=f.app.store.key(created.id);assert.equal(key.stamina_balance,staminaPercent*1120);assert.equal(key.stamina_capacity,staminaPercent*1120);assert.equal(key.nai5_upstream_id,undefined);
+ const subscription=await(await f.relay('/user/subscription',undefined,{Authorization:'Bearer '+created.token})).json();assert.deepEqual(subscription.usage,{percent:staminaPercent,isNegative:false});}
  for(const staminaPercent of [0,101,25.5,'25',null])assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent})).status,400);
  assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'standard',staminaPercent:25})).status,400);
  assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'unknown'})).status,400);assert.equal(f.mock.state.calls.length,0);
@@ -932,7 +933,7 @@ test('两个会员体力独立，上游出队时耗尽只拒绝后一个，不�
  const first=f.relay('/ai/generate-image',payload());await waitFor(()=>generatedCalls(f).length===1);
  const second=f.relay('/ai/generate-image',payload(),{Authorization:'Bearer '+other.token});await waitFor(()=>f.app.router.upstreamQueue.size(1)===2);
  assert.deepEqual((await Promise.all([first,second])).map(r=>r.status),[200,503]);assert.equal(generatedCalls(f).length,1);
- assert.equal(f.app.store.key(f.key.id).stamina_balance,3900);assert.equal(f.app.store.key(other.id).stamina_balance,4000);
+ assert.equal(f.app.store.key(f.key.id).stamina_balance,3900);assert.equal(f.app.store.key(other.id).stamina_balance,28000);
  assert.equal(f.app.store.key(other.id).stamina_reserved,0);assert.equal(f.app.store.key(other.id).balance,100);
 });
 

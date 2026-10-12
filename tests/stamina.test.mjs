@@ -28,25 +28,30 @@ test('创建起满 24 小时的毫秒边界与各档容量，百分比只保留�
   assert.equal(staminaPercent(100),0.1);
 });
 
-test('初始一天、每满 24 小时恢复、停机补算、满额丢弃与时钟回退不重复恢复',t=>{
+test('新 Key 发满上限，每满 24 小时恢复，停机补算、满额丢弃与时钟回退不重复恢复',t=>{
   let store;t.after(()=>store?.close());store=new Store(directory(t));
   const key=store.createKey('体力',100,{tier:'member',staminaPercent:100}),created=store.key(key.id).created_at;
-  assert.equal(store.key(key.id).stamina_balance,16000);
+  assert.equal(store.key(key.id).stamina_balance,112000);
   const refill=period=>store.refillStamina(store.key(key.id),created+period*DAY_MS);
-  assert.equal(store.refillStamina(store.key(key.id),created+DAY_MS-1).stamina_balance,16000);
-  assert.equal(refill(0).stamina_balance,16000);assert.equal(refill(1).stamina_balance,32000);
-  assert.equal(refill(1).stamina_balance,32000);assert.equal(refill(20).stamina_balance,112000);
-  assert.equal(refill(25).stamina_balance,112000);
+  assert.equal(store.refillStamina(store.key(key.id),created+DAY_MS-1).stamina_balance,112000);
+  assert.equal(refill(0).stamina_balance,112000);assert.equal(refill(1).stamina_balance,112000);
   store.db.prepare('UPDATE keys SET stamina_balance=100000 WHERE id=?').run(key.id);
-  assert.equal(refill(25).stamina_balance,100000);assert.equal(refill(24).stamina_balance,100000);
-  assert.equal(refill(26).stamina_balance,112000);
+  assert.equal(refill(1).stamina_balance,100000);assert.equal(refill(2).stamina_balance,112000);
+  store.db.prepare('UPDATE keys SET stamina_balance=0 WHERE id=?').run(key.id);
+  assert.equal(store.refillStamina(store.key(key.id),created+3*DAY_MS-1).stamina_balance,0);
+  assert.equal(refill(3).stamina_balance,16000);assert.equal(refill(3).stamina_balance,16000);
+  assert.equal(refill(20).stamina_balance,112000);
+  store.db.prepare('UPDATE keys SET stamina_balance=100000 WHERE id=?').run(key.id);
+  assert.equal(refill(20).stamina_balance,100000);assert.equal(refill(19).stamina_balance,100000);
+  assert.equal(refill(21).stamina_balance,112000);
 });
 
 test('不同 Key 按自己的创建时间恢复，延迟查询和编辑不移动周期',t=>{
   let store;t.after(()=>store?.close());store=new Store(directory(t));
   const a=store.createKey('A',100,{tier:'member',staminaPercent:100}),b=store.createKey('B',100,{tier:'member',staminaPercent:25});
   const created=store.key(a.id).created_at;
-  store.db.prepare('UPDATE keys SET created_at=? WHERE id=?').run(created+3*3600000,b.id);
+  store.db.prepare('UPDATE keys SET stamina_balance=16000 WHERE id=?').run(a.id);
+  store.db.prepare('UPDATE keys SET created_at=?,stamina_balance=4000 WHERE id=?').run(created+3*3600000,b.id);
   assert.equal(store.refillStamina(store.key(a.id),created+DAY_MS+3600000).stamina_balance,32000);
   assert.equal(store.refillStamina(store.key(b.id),created+DAY_MS+3600000).stamina_balance,4000);
   assert.equal(store.refillStamina(store.key(b.id),created+DAY_MS+3*3600000).stamina_balance,8000);
