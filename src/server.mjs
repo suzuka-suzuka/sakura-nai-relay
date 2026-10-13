@@ -198,7 +198,7 @@ export function createApp(config) {
     const strictStamina = stamina > 0, mode = key.tier === 'member' ? 'anlas-pool' : 'pool';
     const requireAnlas = key.tier === 'member';
     const exhaustedNai5 = key.tier === 'member' && isNai5Generation(path, body) && !hasLocalStamina(key);
-    const staminaUnavailable = () => new HttpError(503, '本地体力可用，但上游暂无可承接本次请求的 V5 体力，请联系管理员补充上游账号', 'UPSTREAM_STAMINA_UNAVAILABLE');
+    const staminaUnavailable = () => new HttpError(503, '上游暂时无法承接本次请求，请稍后重试', 'UPSTREAM_STAMINA_UNAVAILABLE');
     const inspect = async id => {
       const unlock = await router.lockUpstream(id, signal);
       try {
