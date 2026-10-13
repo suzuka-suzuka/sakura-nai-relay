@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { hash, random, seal, unseal, assert, integer, HttpError } from './security.mjs';
 import { capacityFor, dailyFor, refillPeriod, availableStamina } from './stamina.mjs';
+import { grantFullStaminaOnce } from './grant-full-stamina-once.mjs';
 
 const KEY_COLUMNS = `
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, prefix TEXT NOT NULL,
@@ -74,6 +75,7 @@ export class Store {
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
       this.fail(job.id, '服务中断，任务失败，已自动释放预留点数和体力');
+    try { grantFullStaminaOnce(this.db); } catch (error) { this.db.close(); throw error; }
     this.db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
     if (!this.get('admin_password') && !this.get('setup_hash')) {
       const token = random();
