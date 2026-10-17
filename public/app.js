@@ -16,12 +16,13 @@ const icons = {
   coins: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 4 16 4 16 0V6M4 12v6c0 4 16 4 16 0v-6"/>',
   check: '<path d="m5 12 4 4L19 6"/>', shield: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/>', info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/>',
+  tag: '<path d="M4 12V4h8l8 8-8 8z"/><circle cx="9" cy="9" r="1.2" fill="currentColor" stroke="none"/>',
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs' };
-let keySearchTimer, keySearchVersion = 0;
-const titles = { overview: '运行概览', keys: '访问密钥', usage: '用量记录', settings: '上游设置' };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', cdks: null, cdkQuery: '', cdkHit: null };
+let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
+const titles = { overview: '运行概览', keys: '访问密钥', cdks: '兑换码', usage: '用量记录', settings: '上游设置' };
 
 function toast(message, bad = false) {
   const node = document.createElement('div'); node.className = `toast ${bad ? 'bad' : ''}`; node.textContent = message; $('#toasts').append(node); setTimeout(() => node.remove(), 5000);
@@ -87,7 +88,7 @@ function login(initialized) {
 }
 function shell() {
   const title = titles[state.view], d = state.data;
-  $('#app').innerHTML = `<div class="workspace"><aside class="sidebar"><a class="brand" href="#overview" aria-label="Sakura Relay 概览">${flower}<span>Sakura <b>Relay</b></span></a><nav aria-label="主导航">${[['overview','grid','运行概览'],['keys','key','访问密钥'],['usage','activity','用量记录'],['settings','settings','上游设置']].map(([id, symbol, text]) => `<a href="#${id}" aria-label="${text}" class="nav-item ${state.view === id ? 'active' : ''}" ${state.view === id ? 'aria-current="page"' : ''}>${icon(symbol)}<span>${text}</span>${id === 'keys' ? '<small>'+d.keys.length+'</small>' : ''}</a>`).join('')}</nav><div class="sidebar-bottom"><div class="connection-state"><i class="status-dot ${d.settings.configured && d.settings.enabled ? 'online' : ''}"></i><div>${d.settings.configured ? d.settings.enabled ? '中转已启用' : '中转已暂停' : '未配置上游'}</div></div><div class="admin-card"><div class="avatar">S</div><div>管理员</div><button class="icon-button" data-action="logout" aria-label="退出登录">${icon('logout')}</button></div></div></aside><main class="main"><div class="content"><section class="page-heading"><h1>${title}</h1><div class="heading-actions">${state.view === 'keys' || state.view === 'overview' ? '<button class="button primary" data-action="create">'+icon('plus')+'创建密钥</button>' : ''}<button class="icon-button bordered" data-action="refresh" aria-label="刷新数据">${icon('refresh')}</button></div></section><div id="view"></div></div></main></div>`;
+  $('#app').innerHTML = `<div class="workspace"><aside class="sidebar"><a class="brand" href="#overview" aria-label="Sakura Relay 概览">${flower}<span>Sakura <b>Relay</b></span></a><nav aria-label="主导航">${[['overview','grid','运行概览'],['keys','key','访问密钥'],['cdks','tag','兑换码'],['usage','activity','用量记录'],['settings','settings','上游设置']].map(([id, symbol, text]) => `<a href="#${id}" aria-label="${text}" class="nav-item ${state.view === id ? 'active' : ''}" ${state.view === id ? 'aria-current="page"' : ''}>${icon(symbol)}<span>${text}</span>${id === 'keys' ? '<small>'+d.keys.length+'</small>' : ''}</a>`).join('')}</nav><div class="sidebar-bottom"><div class="connection-state"><i class="status-dot ${d.settings.configured && d.settings.enabled ? 'online' : ''}"></i><div>${d.settings.configured ? d.settings.enabled ? '中转已启用' : '中转已暂停' : '未配置上游'}</div></div><div class="admin-card"><div class="avatar">S</div><div>管理员</div><button class="icon-button" data-action="logout" aria-label="退出登录">${icon('logout')}</button></div></div></aside><main class="main"><div class="content"><section class="page-heading"><h1>${title}</h1><div class="heading-actions">${state.view === 'keys' || state.view === 'overview' ? '<button class="button primary" data-action="create">'+icon('plus')+'创建密钥</button>' : ''}<button class="icon-button bordered" data-action="refresh" aria-label="刷新数据">${icon('refresh')}</button></div></section><div id="view"></div></div></main></div>`;
   renderView();
 }
 function quotaFor(id) { return state.quota?.upstreams.find(q => q.id === id); }
@@ -208,9 +209,45 @@ function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
   return `<section class="pool-section"><div class="pool-heading"><h2>上游账户 <span class="count">${rows.length}</span></h2><button class="button primary" data-action="add-upstream">${icon('plus')}添加上游</button></div><div id="upstream-cards" class="upstream-cards">${upstreamCards()}</div></section><form class="panel settings-form" id="settings-form"><div class="panel-title"><h2>访问设置</h2><button class="button small subtle" type="button" data-action="password">修改密码</button></div><div class="access-fields"><div><label>允许的来源<textarea name="origins" rows="3" placeholder="* 或 https://example.com">${e(s.origins.join('\n'))}</textarea></label><p class="field-note">填写 * 允许所有来源；指定站点时每行一个，包含协议和端口，不含路径。访问仍需中转 Key。</p></div><div><label id="relay-address-label">中转地址</label><div class="address-field" aria-labelledby="relay-address-label"><code>${e(state.data.relayUrl)}</code><button class="icon-button" type="button" data-action="copy-url" aria-label="复制中转地址">${icon('copy')}</button></div><div class="toggle-row"><strong>开放中转</strong><label class="switch"><input name="enabled" type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="开放中转"><span></span></label></div></div></div><div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>`;
 }
+const cdkSpec = product => `${product.tier === 'member' ? '会员' : '普通'} · ${product.validDays} 天 · ${number(product.points)} 点${product.tier === 'member' ? ` · 体力 ${product.staminaPercent}%` : ''}`;
+function cdksView() {
+  if (!state.cdks) return '<div class="panel"><div class="empty"><h3>正在读取库存</h3></div></div>';
+  if (state.cdks.error) return `<div class="panel"><div class="empty"><h3>兑换码加载失败</h3><p>${e(state.cdks.error)}</p></div></div>`;
+  const url = `${state.data.relayUrl.replace(/\/$/, '')}/redeem`;
+  const cards = state.cdks.products.map(product => `<article class="cdk-card"><h3>${e(product.name)}</h3><p class="field-note">${e(cdkSpec(product))}</p><div class="cdk-stock"><span>未使用<b>${number(product.unused)}</b></span><span>已兑换<b>${number(product.redeemed)}</b></span></div><div class="cdk-card-actions"><button class="button small primary" data-action="mint-cdks" data-id="${e(product.id)}">生成库存</button><button class="button small subtle" data-action="export-cdks" data-id="${e(product.id)}">复制未使用</button></div></article>`).join('');
+  const rows = state.cdks.redemptions.length ? `<div class="table-scroll"><table><thead><tr><th>兑换时间</th><th>商品</th><th>兑换码</th><th>密钥</th></tr></thead><tbody>${state.cdks.redemptions.map(row => `<tr><td class="date-cell">${date(row.redeemed_at)}</td><td>${e(state.cdks.products.find(product => product.id === row.product_id)?.name || row.product_id)}</td><td><code>${e(row.prefix)}…</code></td><td>${e(row.key_name || '已删除')}<small class="cell-note">${e(row.key_prefix || '')}</small></td></tr>`).join('')}</tbody></table></div>` : empty('还没有人兑换', '买家打开兑换页提交后，密钥会出现在这里。');
+  return `<div class="panel cdk-intro"><div class="panel-title"><div><h2>买家兑换页</h2><p class="muted">生成兑换码后粘贴到阿奇索卡密库存。买家提交兑换码时才创建密钥，每枚只能兑换一次。</p></div></div><div class="cdk-address"><label id="redeem-address-label">兑换地址</label><div class="address-field" aria-labelledby="redeem-address-label"><code id="redeem-url">${e(url)}</code><button class="icon-button" type="button" data-action="copy-redeem-url" aria-label="复制兑换地址">${icon('copy')}</button></div></div></div><div class="cdk-grid">${cards}</div><section class="panel cdk-recent"><div class="panel-title"><div><h2>兑换记录</h2><p class="muted">最近 50 条只显示兑换码前缀。买家没保存密钥时，在这里查找完整兑换码。</p></div><form id="cdk-search-form" class="cdk-search"><label class="search">${icon('search')}<input name="code" type="search" placeholder="完整兑换码" value="${e(state.cdkQuery)}" aria-label="搜索兑换码" maxlength="40" autocomplete="off" spellcheck="false"></label><button class="button small subtle" type="submit">查找</button><div class="form-error" role="alert"></div></form></div><div id="cdk-search-result">${cdkHitView()}</div>${rows}</section>`;
+}
+function cdkHitView() {
+  const hit = state.cdkHit; if (!hit) return '';
+  const name = state.cdks?.products.find(product => product.id === hit.productId)?.name || hit.productId;
+  if (hit.status === 'unused') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">这枚兑换码还没使用，密钥尚未创建。</p></div>`;
+  if (hit.status === 'deleted') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">${e(hit.keyName || '对应密钥')}已于 ${date(hit.redeemedAt)} 兑换，密钥已删除。</p></div>`;
+  return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">${date(hit.redeemedAt)} 兑换 · ${e(hit.keyName)} · ${e(hit.keyPrefix)}</p><button class="button small subtle" type="button" data-action="reveal-cdk-key" data-id="${hit.keyId}">查看密钥</button></div>`;
+}
+function showCodes(title, codes) {
+  modal(title, `<p class="muted">共 ${codes.length} 枚。每行一枚，整段复制到阿奇索卡密库存。</p><textarea id="cdk-codes" readonly rows="12">${e(codes.join('\n'))}</textarea><div class="modal-actions"><button class="button subtle" type="button" data-action="close">关闭</button><button class="button primary" type="button" data-action="copy-cdks">${icon('copy')}复制全部</button></div>`);
+}
+function mintCdks(id) {
+  const product = state.cdks?.products.find(item => item.id === id); if (!product) return;
+  modal('生成兑换码', `<form id="cdk-form" data-product="${e(product.id)}"><p class="muted">${e(product.name)}</p><p class="field-note">${e(cdkSpec(product))}</p><label>生成数量<input name="count" type="number" min="1" max="200" step="1" value="20" required autofocus></label><p class="field-note">每行一枚。复制后粘贴到阿奇索的卡密库存，买家兑换时才会创建密钥。</p><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">生成</button></div></form>`);
+}
+async function loadCdks() {
+  const version = ++cdkVersion;
+  try {
+    const data = await api('/cdks');
+    if (version !== cdkVersion || state.view !== 'cdks') return;
+    state.cdks = data;
+  } catch (error) {
+    if (version !== cdkVersion || state.view !== 'cdks') return;
+    state.cdks = { error: error.message, products: [], redemptions: [] };
+  }
+  const view = $('#view'); if (view && state.view === 'cdks') view.innerHTML = cdksView();
+}
 function renderView() {
-  $('#view').innerHTML = ({ overview, keys: keysView, usage: usageView, settings: settingsView })[state.view]();
+  $('#view').innerHTML = ({ overview, keys: keysView, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
+  if (state.view === 'cdks') void loadCdks();
 }
 async function refresh() { state.data = await api('/snapshot'); state.keyMatches = null; state.keySearchError = ''; shell(); }
 async function quota() {
@@ -269,6 +306,8 @@ document.addEventListener('click', async event => {
   if (action === 'key-detail') return withButton(button, () => detail(id));
   if (action === 'job') return jobDetail(id);
   if (action === 'logs') { state.logs = button.dataset.tab; return renderView(); }
+  if (action === 'mint-cdks') return mintCdks(id);
+  if (action === 'reveal-cdk-key') return withButton(button, async () => { if (!state.data.keys.some(key => key.id === Number(id))) await refresh(); await detail(id); });
   if (action === 'password') return modal('修改管理员密码', '<form id="password-form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label><label>确认新密码<input name="confirm" type="password" autocomplete="new-password" minlength="12" required></label><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button primary" type="submit">保存新密码</button></div></form>');
   await withButton(button, async () => {
     if (action === 'refresh') { await refresh(); if (state.data.settings.configured) await quota(); }
@@ -277,6 +316,13 @@ document.addEventListener('click', async event => {
     if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
     if (action === 'confirm-remove-key') { await api('/keys/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('密钥已删除，历史记录已保留'); }
     if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
+    if (action === 'copy-redeem-url') await copy($('#redeem-url').textContent, $('#redeem-url'));
+    if (action === 'copy-cdks') { const node = $('#cdk-codes'); await copy(node.value, node); }
+    if (action === 'export-cdks') {
+      const result = await api('/cdks/export', { method: 'POST', body: { product: id } });
+      if (!result.codes.length) throw new Error('这个商品没有未使用的兑换码');
+      showCodes('未使用的兑换码', result.codes);
+    }
     if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }
     if (action === 'toggle-key') { const key = state.data.keys.find(k => k.id === Number(id)); await api(`/keys/${id}`, { method: 'POST', body: { enabled: !key.enabled } }); closeModal(); await refresh(); toast(key.enabled ? '密钥已停用' : '密钥已启用'); }
     if (action === 'logout') { await api('/logout', { method: 'POST', body: {} }); state.data = null; state.csrf = null; state.quota = null; await init(); }
@@ -315,6 +361,16 @@ document.addEventListener('submit', async event => {
       if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); await quota(); toast('上游已保存'); }
       if (form.id === 'settings-form') {
         await api('/settings', { method: 'PUT', body: { enabled: values.enabled === 'on', origins: values.origins.split('\n').map(x => x.trim()).filter(Boolean) } }); await refresh(); await quota(); toast('设置已保存');
+      }
+      if (form.id === 'cdk-search-form') {
+        state.cdkQuery = String(values.code || '');
+        state.cdkHit = await api('/cdks/search', { method: 'POST', body: { code: state.cdkQuery } });
+        const node = $('#cdk-search-result'); if (node) node.innerHTML = cdkHitView();
+      }
+      if (form.id === 'cdk-form') {
+        const result = await api('/cdks', { method: 'POST', body: { product: form.dataset.product, count: Number(values.count) } });
+        showCodes('兑换码已生成', result.codes);
+        void loadCdks();
       }
       if (form.id === 'password-form') {
         if (values.password !== values.confirm) throw new Error('两次输入的密码不一致');

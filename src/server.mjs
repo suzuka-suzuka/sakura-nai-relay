@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { Store } from './db.mjs';
 import { HttpError, assert, integer, hash, random, equal, passwordHash, verifyPassword } from './security.mjs';
 import { balanceOf, upstreamSubscription, downstreamSubscription, billingAccount, isActiveOpus, hasNai5Allowance, isNai5Generation, reservation, quoteRequest, StreamCheck } from './billing.mjs';
-import { hasLocalStamina } from './stamina.mjs';
+import { hasLocalStamina, staminaPercent } from './stamina.mjs';
+import { productById } from './cdk.mjs';
 import { upstreamClient, readBounded } from './upstream.mjs';
 import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
@@ -180,6 +181,22 @@ export function createApp(config) {
         store.updateKey(id, body);
       }
       return json(res, 200, { ok: true });
+    }
+    if (path === '/admin/api/cdks' && req.method === 'GET') return json(res, 200, { products: store.cdkSummary(), redemptions: store.cdkRedemptions() });
+    if (path === '/admin/api/cdks' && req.method === 'POST') {
+      const body = parse(await readBody(req, 4096));
+      assert(productById(body.product), '商品不存在');
+      return json(res, 201, store.createCdks(body.product, integer(body.count, 1, 200, '生成数量')));
+    }
+    if (path === '/admin/api/cdks/export' && req.method === 'POST') {
+      const body = parse(await readBody(req, 4096));
+      assert(productById(body.product), '商品不存在');
+      return json(res, 200, { codes: store.unusedCdks(body.product) });
+    }
+    if (path === '/admin/api/cdks/search' && req.method === 'POST') {
+      const body = parse(await readBody(req, 4096));
+      assert(typeof body.code === 'string' && body.code.trim(), '请填写兑换码');
+      return json(res, 200, store.findCdk(body.code));
     }
     if (path === '/admin/api/password' && req.method === 'POST') {
       allow(`password:${req.socket.remoteAddress}`, 5, 10 * 60000);
@@ -443,7 +460,16 @@ export function createApp(config) {
         return json(res, 200, JSON.parse(bytes.toString()));
       }
       if (path === '/healthz' && req.method === 'GET') return json(res, 200, { ok: true });
-      const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/admin': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+      if (path === '/api/redeem' && req.method === 'POST') {
+        allow(`redeem:${req.socket.remoteAddress || 'local'}`, 120, 60000);
+        const body = parse(await readBody(req, 4096));
+        const result = store.redeemCdk(body.code), key = result.key;
+        return json(res, 200, {
+          token: result.token, relayUrl: config.publicOrigin, name: key.name, tier: key.tier, points: key.balance,
+          staminaPercent: key.tier === 'member' ? staminaPercent(key.stamina_capacity) : 0, expiresAt: key.expires_at,
+        });
+      }
+      const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/admin': ['index.html', 'text/html; charset=utf-8'], '/redeem': ['redeem.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/redeem.js': ['redeem.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
       assert(req.method === 'GET' && assets[path], '页面不存在', 404);
       const [file, type] = assets[path]; res.writeHead(200, { 'Content-Type': type }); res.end(readFileSync(join(PUBLIC, file)));
     } catch (error) {

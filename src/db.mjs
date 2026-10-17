@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { hash, random, seal, unseal, assert, integer, HttpError } from './security.mjs';
 import { capacityFor, dailyFor, refillPeriod, availableStamina } from './stamina.mjs';
+import { PRODUCTS, productById, createCode, normalizeCode } from './cdk.mjs';
 import { grantFullStaminaOnce } from './grant-full-stamina-once.mjs';
 
 const KEY_COLUMNS = `
@@ -71,6 +72,11 @@ export class Store {
     });
     if (!this.db.prepare('PRAGMA table_info(keys)').all().some(c => c.name === 'retired_at'))
       this.db.exec('ALTER TABLE keys ADD COLUMN retired_at INTEGER');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS cdks (
+      id INTEGER PRIMARY KEY, product_id TEXT NOT NULL, code_hash TEXT NOT NULL UNIQUE,
+      code_encrypted TEXT NOT NULL, prefix TEXT NOT NULL, created_at INTEGER NOT NULL,
+      redeemed_at INTEGER, key_id INTEGER REFERENCES keys(id));
+      CREATE INDEX IF NOT EXISTS cdks_product ON cdks(product_id, redeemed_at);`);
     this.db.exec('CREATE INDEX IF NOT EXISTS jobs_upstream_state ON jobs(upstream_id,status)');
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
@@ -178,17 +184,74 @@ export class Store {
     if (expires !== null) integer(expires, 1, 8640000000000000, '到期时间');
     return { tier, capacity, expires };
   }
-  createKey(name, balance, options = {}) {
+  insertKey(name, balance, options = {}) {
     const token = `skr_${random()}`;
+    const createdAt = Date.now();
+    const { tier, capacity, expires } = this.keySettings(options);
+    name = this.recordName(name ?? '', 'keys');
+    const result = this.db.prepare(`INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,expires_at,stamina_capacity,stamina_balance,stamina_refill_period)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,capacity,0);
+    const id = Number(result.lastInsertRowid);
+    if (balance !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', options.grantNote ?? '创建密钥', Date.now());
+    return { id, token };
+  }
+  createKey(name, balance, options = {}) { return this.transaction(() => this.insertKey(name, balance, options)); }
+  cdkSummary() {
+    const counts = new Map(this.db.prepare(`SELECT product_id, SUM(key_id IS NULL) AS unused, SUM(key_id IS NOT NULL) AS redeemed FROM cdks GROUP BY product_id`).all().map(row => [row.product_id, row]));
+    return PRODUCTS.map(product => ({ ...product, unused: counts.get(product.id)?.unused ?? 0, redeemed: counts.get(product.id)?.redeemed ?? 0 }));
+  }
+  createCdks(productId, count) {
+    const product = productById(productId); assert(product, '商品不存在');
     return this.transaction(() => {
-      const createdAt = Date.now();
-      const { tier, capacity, expires } = this.keySettings(options);
-      name = this.recordName(name ?? '', 'keys');
-      const result = this.db.prepare(`INSERT INTO keys(name,token_hash,prefix,balance,created_at,token_encrypted,tier,expires_at,stamina_capacity,stamina_balance,stamina_refill_period)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(name,hash(token),`${token.slice(0,10)}…${token.slice(-4)}`,balance,createdAt,seal(token,this.master),tier,expires,capacity,capacity,0);
-      const id = Number(result.lastInsertRowid);
-      if (balance !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, balance, 'grant', '创建密钥', Date.now());
-      return { id, token };
+      const insert = this.db.prepare('INSERT INTO cdks(product_id,code_hash,code_encrypted,prefix,created_at) VALUES(?,?,?,?,?)');
+      const codes = Array.from({ length: count }, () => {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const code = createCode();
+          try { insert.run(product.id, hash(code), seal(code, this.master), code.slice(0, 8), Date.now()); return code; }
+          catch (error) { if (!String(error.message).includes('UNIQUE')) throw error; }
+        }
+        assert(false, '兑换码生成失败，请重试', 500);
+      });
+      return { product: product.id, codes };
+    });
+  }
+  unusedCdks(productId) {
+    assert(productById(productId), '商品不存在');
+    return this.db.prepare('SELECT code_encrypted FROM cdks WHERE product_id=? AND key_id IS NULL ORDER BY id').all(productId).map(row => unseal(row.code_encrypted, this.master));
+  }
+  cdkRedemptions(limit = 50) {
+    return this.db.prepare(`SELECT cdks.product_id, cdks.prefix, cdks.redeemed_at, cdks.key_id, keys.name AS key_name, keys.prefix AS key_prefix
+      FROM cdks LEFT JOIN keys ON keys.id=cdks.key_id WHERE cdks.key_id IS NOT NULL ORDER BY cdks.redeemed_at DESC LIMIT ?`).all(limit);
+  }
+  findCdk(rawCode) {
+    const code = normalizeCode(rawCode);
+    const row = this.db.prepare(`SELECT cdks.product_id, cdks.prefix, cdks.created_at, cdks.redeemed_at, cdks.key_id,
+      keys.name AS key_name, keys.prefix AS key_prefix, keys.retired_at
+      FROM cdks LEFT JOIN keys ON keys.id=cdks.key_id WHERE cdks.code_hash=?`).get(hash(code));
+    assert(row, '没有这枚兑换码', 404);
+    const deleted = row.key_id !== null && row.retired_at !== null;
+    return {
+      productId: row.product_id, prefix: row.prefix, createdAt: row.created_at, redeemedAt: row.redeemed_at,
+      status: row.key_id === null ? 'unused' : deleted ? 'deleted' : 'redeemed',
+      keyId: deleted ? null : row.key_id, keyName: row.key_name, keyPrefix: deleted ? null : row.key_prefix,
+    };
+  }
+  redeemCdk(rawCode) {
+    const code = normalizeCode(rawCode);
+    const used = '这枚兑换码已经兑换过，请联系管理员查询密钥';
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM cdks WHERE code_hash=?').get(hash(code));
+      assert(row, '兑换码无效', 404);
+      assert(!row.key_id, used, 409);
+      const product = productById(row.product_id); assert(product, '兑换码商品不存在', 500);
+      const created = this.insertKey(product.name, product.points, {
+        tier: product.tier, validDays: product.validDays, grantNote: '兑换码创建',
+        ...(product.staminaPercent === undefined ? {} : { staminaPercent: product.staminaPercent }),
+      });
+      const updated = this.db.prepare('UPDATE cdks SET redeemed_at=?, key_id=? WHERE id=? AND key_id IS NULL').run(Date.now(), created.id, row.id);
+      assert(updated.changes === 1, used, 409);
+      const key = this.key(created.id);
+      return { token: created.token, key };
     });
   }
   updateKey(id, options) {
