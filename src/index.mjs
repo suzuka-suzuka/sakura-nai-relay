@@ -5,6 +5,14 @@ import { createApp } from './server.mjs';
 
 const host = process.env.HOST ?? '127.0.0.1', port = Number(process.env.PORT ?? 3100);
 const publicOrigin = new URL(process.env.PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`).origin;
+function publicUrl(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const url = new URL(raw);
+  if (!['http:', 'https:'].includes(url.protocol) || url.search || url.hash || url.username || url.password) throw new Error(`${name} 无效`);
+  return url.href.replace(/\/+$/, '');
+}
+const relayUrl = publicUrl('RELAY_PUBLIC_URL'), redeemUrl = publicUrl('REDEEM_PUBLIC_URL');
 const upstreamOrigin = new URL(process.env.UPSTREAM_ORIGIN ?? 'https://image.novelai.net').origin;
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 无效');
 if (!upstreamOrigin.startsWith('https://') && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(upstreamOrigin)) throw new Error('上游必须使用 HTTPS');
@@ -19,7 +27,7 @@ try {
   }
 } catch (error) { if (error.code !== 'ENOENT') throw error; }
 const lockFd = openSync(lock, 'wx', 0o600); writeFileSync(lockFd, String(process.pid)); closeSync(lockFd);
-const app = createApp({ dataDir, publicOrigin, upstreamOrigin, cookieSecure: process.env.COOKIE_SECURE === 'true' || publicOrigin.startsWith('https://') });
+const app = createApp({ dataDir, publicOrigin, relayUrl, redeemUrl, upstreamOrigin, cookieSecure: process.env.COOKIE_SECURE === 'true' || publicOrigin.startsWith('https://') });
 app.server.listen(port, host, () => {
   console.log(`Sakura Relay · ${publicOrigin}`);
   if (!app.store.get('admin_password')) console.log(`首次使用：打开控制台，用 ${resolve(dataDir, 'setup-code.txt')} 中的初始化码设置管理员密码。`);

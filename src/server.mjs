@@ -82,7 +82,7 @@ export function createApp(config) {
     if (path === '/admin/api/snapshot' && req.method === 'GET') {
       const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
       const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
-      return json(res, 200, { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys(), jobs: store.jobs(), ledger: store.ledger(), stats, trend, busy: router.busy.size > 0, relayUrl: config.publicOrigin });
+      return json(res, 200, { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys(), jobs: store.jobs(), ledger: store.ledger(), stats, trend, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` });
     }
     if (path === '/admin/api/quota' && req.method === 'GET') {
       allow('admin-quota', 20);
@@ -465,7 +465,7 @@ export function createApp(config) {
         const body = parse(await readBody(req, 4096));
         const result = store.redeemCdk(body.code), key = result.key;
         return json(res, 200, {
-          token: result.token, relayUrl: config.publicOrigin, name: key.name, tier: key.tier, points: key.balance,
+          token: result.token, relayUrl: config.relayUrl || config.publicOrigin, name: key.name, tier: key.tier, points: key.balance,
           staminaPercent: key.tier === 'member' ? staminaPercent(key.stamina_capacity) : 0, expiresAt: key.expires_at,
         });
       }

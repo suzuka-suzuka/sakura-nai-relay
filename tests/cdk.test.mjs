@@ -8,9 +8,9 @@ import { createApp } from '../src/server.mjs';
 const origin = 'http://127.0.0.1:3100';
 const day = 86400000;
 
-async function fixture(t) {
+async function fixture(t, extra = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'sakura-cdk-'));
-  const app = createApp({ dataDir: directory, publicOrigin: origin });
+  const app = createApp({ dataDir: directory, publicOrigin: origin, ...extra });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${app.server.address().port}`;
   const setup = await fetch(base + '/admin/api/setup', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ code: readFileSync(join(directory, 'setup-code.txt'), 'utf8'), password: 'test-only-password-123' }) });
@@ -130,4 +130,22 @@ test('同一枚兑换码并发提交只创建一把密钥', async t => {
   assert.equal(denied[0].body.token, undefined);
   assert.equal(app.store.keys().length, 1);
   assert.equal(app.store.authenticate(ok[0].body.token).name, '体验：1天Opus');
+});
+
+test('可单独配置对外中转地址与兑换页地址，管理仍按 PUBLIC_ORIGIN 校验', async t => {
+  const { base, call } = await fixture(t, { relayUrl: 'https://relay.example.com', redeemUrl: 'https://redeem.example.com' });
+  const status = await (await call('/admin/api/snapshot')).json();
+  assert.equal(status.relayUrl, 'https://relay.example.com');
+  assert.equal(status.redeemUrl, 'https://redeem.example.com');
+  const stock = await mint(call, 'trial-100');
+  const result = await redeem(base, stock.codes[0]);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.relayUrl, 'https://relay.example.com');
+});
+
+test('未配置时中转地址回退到 PUBLIC_ORIGIN', async t => {
+  const { call } = await fixture(t);
+  const status = await (await call('/admin/api/snapshot')).json();
+  assert.equal(status.relayUrl, origin);
+  assert.equal(status.redeemUrl, origin + '/redeem');
 });
