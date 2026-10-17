@@ -154,3 +154,23 @@ test('启动自动释放历史待处理及旧核对任务，重复重启不重�
     rmSync(directory,{recursive:true,force:true});
   }
 });
+
+test('旧兑换码表自动补充作废字段，已有兑换码保留可用', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'sakura-schema-test-')); let store, db;
+  try {
+    store = new Store(directory);
+    const { codes } = store.createCdks('trial-100', 2);
+    store.redeemCdk(codes[0]);
+    store.close(); store = null;
+    db = new DatabaseSync(join(directory, 'relay.sqlite'));
+    db.exec('ALTER TABLE cdks DROP COLUMN voided_at; ALTER TABLE cdks DROP COLUMN void_reason');
+    db.close(); db = null;
+    store = new Store(directory);
+    assert.ok(store.db.prepare('PRAGMA table_info(cdks)').all().some(c => c.name === 'voided_at'));
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM cdks').get().n, 2);
+    assert.equal(store.findCdk(codes[0]).status, 'redeemed');
+    assert.deepEqual(store.unusedCdks('trial-100'), [codes[1]]);
+    store.close(); store = new Store(directory);
+    assert.equal(store.findCdk(codes[1]).status, 'unused');
+  } finally { db?.close(); store?.close(); rmSync(directory, { recursive: true, force: true }); }
+});

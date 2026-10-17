@@ -149,3 +149,49 @@ test('未配置时中转地址回退到 PUBLIC_ORIGIN', async t => {
   assert.equal(status.relayUrl, origin);
   assert.equal(status.redeemUrl, origin + '/redeem');
 });
+
+test('作废未兑换的兑换码后不能再兑换，库存与导出不再计入', async t => {
+  const { app, base, call } = await fixture(t);
+  const { codes } = await mint(call, 'trial-100', 2);
+  const voided = await call('/admin/api/cdks/void', 'POST', { code: codes[0].toLowerCase(), reason: '淘宝退款' });
+  assert.equal(voided.status, 200);
+  const hit = await voided.json();
+  assert.equal(hit.status, 'voided');
+  assert.equal(hit.voidReason, '淘宝退款');
+  assert.ok(hit.voidedAt);
+  const denied = await redeem(base, codes[0]);
+  assert.equal(denied.status, 410);
+  assert.match(denied.body.error, /已作废/);
+  assert.equal(app.store.keys().length, 0);
+  assert.equal((await call('/admin/api/cdks/void', 'POST', { code: codes[0] })).status, 409);
+  const left = await (await call('/admin/api/cdks/export', 'POST', { product: 'trial-100' })).json();
+  assert.deepEqual(left.codes, [codes[1]]);
+  const summary = (await (await call('/admin/api/cdks')).json()).products.find(p => p.id === 'trial-100');
+  assert.equal(summary.unused, 1); assert.equal(summary.voided, 1);
+  assert.equal((await call('/admin/api/cdks/void', 'POST', { code: 'CDK-AAAA-AAAA-AAAA' })).status, 404);
+  assert.equal((await fetch(base + '/admin/api/cdks/void', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ code: codes[1] }) })).status, 401);
+});
+
+test('已兑换的兑换码必须确认停用密钥才能作废', async t => {
+  const { app, base, call } = await fixture(t);
+  const { codes } = await mint(call, 'trial-100');
+  const first = await redeem(base, codes[0]);
+  const keyId = app.store.authenticate(first.body.token).id;
+  const refused = await call('/admin/api/cdks/void', 'POST', { code: codes[0] });
+  assert.equal(refused.status, 409);
+  assert.equal(app.store.key(keyId).enabled, 1);
+  const done = await (await call('/admin/api/cdks/void', 'POST', { code: codes[0], disableKey: true })).json();
+  assert.equal(done.status, 'redeemed');
+  assert.equal(done.keyEnabled, false);
+  assert.ok(done.voidedAt);
+  assert.equal(app.store.key(keyId).enabled, 0);
+  assert.throws(() => app.store.authenticate(first.body.token));
+});
+
+test('作废与兑换在同一事务内互斥', async t => {
+  const { app, base, call } = await fixture(t);
+  const { codes } = await mint(call, 'trial-100');
+  const [r, v] = await Promise.all([redeem(base, codes[0]), call('/admin/api/cdks/void', 'POST', { code: codes[0] })]);
+  if (r.status === 200) { assert.equal(v.status, 409); assert.equal(app.store.keys().length, 1); }
+  else { assert.equal(r.status, 410); assert.equal(v.status, 200); assert.equal(app.store.keys().length, 0); }
+});

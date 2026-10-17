@@ -214,16 +214,18 @@ function cdksView() {
   if (!state.cdks) return '<div class="panel"><div class="empty"><h3>正在读取库存</h3></div></div>';
   if (state.cdks.error) return `<div class="panel"><div class="empty"><h3>兑换码加载失败</h3><p>${e(state.cdks.error)}</p></div></div>`;
   const url = state.data.redeemUrl || `${state.data.relayUrl.replace(/\/$/, '')}/redeem`;
-  const cards = state.cdks.products.map(product => `<article class="cdk-card"><h3>${e(product.name)}</h3><p class="field-note">${e(cdkSpec(product))}</p><div class="cdk-stock"><span>未使用<b>${number(product.unused)}</b></span><span>已兑换<b>${number(product.redeemed)}</b></span></div><div class="cdk-card-actions"><button class="button small primary" data-action="mint-cdks" data-id="${e(product.id)}">生成库存</button><button class="button small subtle" data-action="export-cdks" data-id="${e(product.id)}">复制未使用</button></div></article>`).join('');
+  const cards = state.cdks.products.map(product => `<article class="cdk-card"><h3>${e(product.name)}</h3><p class="field-note">${e(cdkSpec(product))}</p><div class="cdk-stock"><span>未使用<b>${number(product.unused)}</b></span><span>已兑换<b>${number(product.redeemed)}</b></span>${product.voided ? `<span>已作废<b>${number(product.voided)}</b></span>` : ''}</div><div class="cdk-card-actions"><button class="button small primary" data-action="mint-cdks" data-id="${e(product.id)}">生成库存</button><button class="button small subtle" data-action="export-cdks" data-id="${e(product.id)}">复制未使用</button></div></article>`).join('');
   const rows = state.cdks.redemptions.length ? `<div class="table-scroll"><table><thead><tr><th>兑换时间</th><th>商品</th><th>兑换码</th><th>密钥</th></tr></thead><tbody>${state.cdks.redemptions.map(row => `<tr><td class="date-cell">${date(row.redeemed_at)}</td><td>${e(state.cdks.products.find(product => product.id === row.product_id)?.name || row.product_id)}</td><td><code>${e(row.prefix)}…</code></td><td>${e(row.key_name || '已删除')}<small class="cell-note">${e(row.key_prefix || '')}</small></td></tr>`).join('')}</tbody></table></div>` : empty('还没有人兑换', '买家打开兑换页提交后，密钥会出现在这里。');
   return `<div class="panel cdk-intro"><div class="panel-title"><div><h2>买家兑换页</h2><p class="muted">生成兑换码后粘贴到阿奇索卡密库存。买家提交兑换码时才创建密钥，每枚只能兑换一次。</p></div></div><div class="cdk-address"><label id="redeem-address-label">兑换地址</label><div class="address-field" aria-labelledby="redeem-address-label"><code id="redeem-url">${e(url)}</code><button class="icon-button" type="button" data-action="copy-redeem-url" aria-label="复制兑换地址">${icon('copy')}</button></div></div></div><div class="cdk-grid">${cards}</div><section class="panel cdk-recent"><div class="panel-title"><div><h2>兑换记录</h2><p class="muted">最近 50 条只显示兑换码前缀。买家没保存密钥时，在这里查找完整兑换码。</p></div><form id="cdk-search-form" class="cdk-search"><label class="search">${icon('search')}<input name="code" type="search" placeholder="完整兑换码" value="${e(state.cdkQuery)}" aria-label="搜索兑换码" maxlength="40" autocomplete="off" spellcheck="false"></label><button class="button small subtle" type="submit">查找</button><div class="form-error" role="alert"></div></form></div><div id="cdk-search-result">${cdkHitView()}</div>${rows}</section>`;
 }
 function cdkHitView() {
   const hit = state.cdkHit; if (!hit) return '';
   const name = state.cdks?.products.find(product => product.id === hit.productId)?.name || hit.productId;
-  if (hit.status === 'unused') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">这枚兑换码还没使用，密钥尚未创建。</p></div>`;
+  const voided = hit.voidedAt ? `<p class="muted">已于 ${date(hit.voidedAt)} 作废${hit.voidReason ? ' · ' + e(hit.voidReason) : ''}</p>` : '';
+  if (hit.status === 'voided') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">这枚兑换码未兑换，已作废，买家提交会提示已作废。</p>${voided}</div>`;
+  if (hit.status === 'unused') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">这枚兑换码还没使用，密钥尚未创建。</p><button class="button small danger" type="button" data-action="void-cdk">作废兑换码</button></div>`;
   if (hit.status === 'deleted') return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">${e(hit.keyName || '对应密钥')}已于 ${date(hit.redeemedAt)} 兑换，密钥已删除。</p></div>`;
-  return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">${date(hit.redeemedAt)} 兑换 · ${e(hit.keyName)} · ${e(hit.keyPrefix)}</p><button class="button small subtle" type="button" data-action="reveal-cdk-key" data-id="${hit.keyId}">查看密钥</button></div>`;
+  return `<div class="cdk-hit"><strong>${e(name)}</strong><p class="muted">${date(hit.redeemedAt)} 兑换 · ${e(hit.keyName)} · ${e(hit.keyPrefix)}${hit.keyEnabled ? '' : ' · 已停用'}</p>${voided}<div class="cdk-card-actions"><button class="button small subtle" type="button" data-action="reveal-cdk-key" data-id="${hit.keyId}">查看密钥</button>${hit.keyEnabled || !hit.voidedAt ? '<button class="button small danger" type="button" data-action="void-cdk">作废并停用密钥</button>' : ''}</div></div>`;
 }
 function showCodes(title, codes) {
   modal(title, `<p class="muted">共 ${codes.length} 枚。每行一枚，整段复制到阿奇索卡密库存。</p><textarea id="cdk-codes" readonly rows="12">${e(codes.join('\n'))}</textarea><div class="modal-actions"><button class="button subtle" type="button" data-action="close">关闭</button><button class="button primary" type="button" data-action="copy-cdks">${icon('copy')}复制全部</button></div>`);
@@ -307,6 +309,11 @@ document.addEventListener('click', async event => {
   if (action === 'job') return jobDetail(id);
   if (action === 'logs') { state.logs = button.dataset.tab; return renderView(); }
   if (action === 'mint-cdks') return mintCdks(id);
+  if (action === 'void-cdk') {
+    const hit = state.cdkHit; if (!hit) return;
+    const redeemed = hit.status === 'redeemed';
+    return modal(redeemed ? '作废并停用密钥' : '作废兑换码', `<form id="cdk-void-form" data-disable="${redeemed}"><p class="muted">${redeemed ? `这枚兑换码已兑换出密钥 ${e(hit.keyName)}（${e(hit.keyPrefix)}）。确认后密钥立即停用，买家无法继续使用；记录会保留，之后可在访问密钥里重新启用。` : '作废后买家提交这枚兑换码会提示已作废，记录会保留。阿奇索那边请另外补一枚新码。'}</p><label>备注（可选）<input name="reason" maxlength="160" placeholder="例如：淘宝订单退款"></label><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button subtle" type="button" data-action="close">取消</button><button class="button danger" type="submit">${redeemed ? '作废并停用' : '确认作废'}</button></div></form>`);
+  }
   if (action === 'reveal-cdk-key') return withButton(button, async () => { if (!state.data.keys.some(key => key.id === Number(id))) await refresh(); await detail(id); });
   if (action === 'password') return modal('修改管理员密码', '<form id="password-form"><label>当前密码<input name="current" type="password" autocomplete="current-password" required></label><label>新密码<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label><label>确认新密码<input name="confirm" type="password" autocomplete="new-password" minlength="12" required></label><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button primary" type="submit">保存新密码</button></div></form>');
   await withButton(button, async () => {
@@ -366,6 +373,12 @@ document.addEventListener('submit', async event => {
         state.cdkQuery = String(values.code || '');
         state.cdkHit = await api('/cdks/search', { method: 'POST', body: { code: state.cdkQuery } });
         const node = $('#cdk-search-result'); if (node) node.innerHTML = cdkHitView();
+      }
+      if (form.id === 'cdk-void-form') {
+        state.cdkHit = await api('/cdks/void', { method: 'POST', body: { code: state.cdkQuery, reason: values.reason, disableKey: form.dataset.disable === 'true' } });
+        closeModal(); toast(form.dataset.disable === 'true' ? '兑换码已作废，密钥已停用' : '兑换码已作废');
+        const node = $('#cdk-search-result'); if (node) node.innerHTML = cdkHitView();
+        void loadCdks();
       }
       if (form.id === 'cdk-form') {
         const result = await api('/cdks', { method: 'POST', body: { product: form.dataset.product, count: Number(values.count) } });

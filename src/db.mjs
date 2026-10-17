@@ -77,6 +77,10 @@ export class Store {
       code_encrypted TEXT NOT NULL, prefix TEXT NOT NULL, created_at INTEGER NOT NULL,
       redeemed_at INTEGER, key_id INTEGER REFERENCES keys(id));
       CREATE INDEX IF NOT EXISTS cdks_product ON cdks(product_id, redeemed_at);`);
+    const cdkColumns = this.db.prepare('PRAGMA table_info(cdks)').all();
+    if (!cdkColumns.some(c => c.name === 'voided_at')) this.transaction(() => {
+      this.db.exec('ALTER TABLE cdks ADD COLUMN voided_at INTEGER; ALTER TABLE cdks ADD COLUMN void_reason TEXT');
+    });
     this.db.exec('CREATE INDEX IF NOT EXISTS jobs_upstream_state ON jobs(upstream_id,status)');
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
@@ -197,8 +201,8 @@ export class Store {
   }
   createKey(name, balance, options = {}) { return this.transaction(() => this.insertKey(name, balance, options)); }
   cdkSummary() {
-    const counts = new Map(this.db.prepare(`SELECT product_id, SUM(key_id IS NULL) AS unused, SUM(key_id IS NOT NULL) AS redeemed FROM cdks GROUP BY product_id`).all().map(row => [row.product_id, row]));
-    return PRODUCTS.map(product => ({ ...product, unused: counts.get(product.id)?.unused ?? 0, redeemed: counts.get(product.id)?.redeemed ?? 0 }));
+    const counts = new Map(this.db.prepare(`SELECT product_id, SUM(key_id IS NULL AND voided_at IS NULL) AS unused, SUM(key_id IS NOT NULL) AS redeemed, SUM(key_id IS NULL AND voided_at IS NOT NULL) AS voided FROM cdks GROUP BY product_id`).all().map(row => [row.product_id, row]));
+    return PRODUCTS.map(product => ({ ...product, unused: counts.get(product.id)?.unused ?? 0, redeemed: counts.get(product.id)?.redeemed ?? 0, voided: counts.get(product.id)?.voided ?? 0 }));
   }
   createCdks(productId, count) {
     const product = productById(productId); assert(product, '商品不存在');
@@ -217,7 +221,7 @@ export class Store {
   }
   unusedCdks(productId) {
     assert(productById(productId), '商品不存在');
-    return this.db.prepare('SELECT code_encrypted FROM cdks WHERE product_id=? AND key_id IS NULL ORDER BY id').all(productId).map(row => unseal(row.code_encrypted, this.master));
+    return this.db.prepare('SELECT code_encrypted FROM cdks WHERE product_id=? AND key_id IS NULL AND voided_at IS NULL ORDER BY id').all(productId).map(row => unseal(row.code_encrypted, this.master));
   }
   cdkRedemptions(limit = 50) {
     return this.db.prepare(`SELECT cdks.product_id, cdks.prefix, cdks.redeemed_at, cdks.key_id, keys.name AS key_name, keys.prefix AS key_prefix
@@ -225,16 +229,34 @@ export class Store {
   }
   findCdk(rawCode) {
     const code = normalizeCode(rawCode);
-    const row = this.db.prepare(`SELECT cdks.product_id, cdks.prefix, cdks.created_at, cdks.redeemed_at, cdks.key_id,
-      keys.name AS key_name, keys.prefix AS key_prefix, keys.retired_at
+    const row = this.db.prepare(`SELECT cdks.product_id, cdks.prefix, cdks.created_at, cdks.redeemed_at, cdks.key_id, cdks.voided_at, cdks.void_reason,
+      keys.name AS key_name, keys.prefix AS key_prefix, keys.retired_at, keys.enabled AS key_enabled
       FROM cdks LEFT JOIN keys ON keys.id=cdks.key_id WHERE cdks.code_hash=?`).get(hash(code));
     assert(row, '没有这枚兑换码', 404);
     const deleted = row.key_id !== null && row.retired_at !== null;
     return {
       productId: row.product_id, prefix: row.prefix, createdAt: row.created_at, redeemedAt: row.redeemed_at,
-      status: row.key_id === null ? 'unused' : deleted ? 'deleted' : 'redeemed',
+      status: row.key_id === null ? (row.voided_at === null ? 'unused' : 'voided') : deleted ? 'deleted' : 'redeemed',
       keyId: deleted ? null : row.key_id, keyName: row.key_name, keyPrefix: deleted ? null : row.key_prefix,
+      keyEnabled: row.key_id === null || deleted ? false : !!row.key_enabled, voidedAt: row.voided_at, voidReason: row.void_reason,
     };
+  }
+  // 退款处理：未兑换的码直接作废；已兑换的码必须显式确认 disableKey 才会停用对应密钥。
+  voidCdk(rawCode, { reason = null, disableKey = false } = {}) {
+    const code = normalizeCode(rawCode);
+    this.transaction(() => {
+      const row = this.db.prepare('SELECT id,key_id,voided_at FROM cdks WHERE code_hash=?').get(hash(code));
+      assert(row, '没有这枚兑换码', 404);
+      if (row.key_id === null) {
+        assert(row.voided_at === null, '这枚兑换码已经作废', 409);
+      } else {
+        const key = this.key(row.key_id);
+        assert(disableKey || !key || key.retired_at !== null, '这枚兑换码已兑换，需同时停用对应密钥才能作废', 409);
+        if (key && key.retired_at === null) this.db.prepare('UPDATE keys SET enabled=0 WHERE id=?').run(row.key_id);
+      }
+      this.db.prepare('UPDATE cdks SET voided_at=COALESCE(voided_at,?),void_reason=COALESCE(?,void_reason) WHERE id=?').run(Date.now(), reason, row.id);
+    });
+    return this.findCdk(code);
   }
   redeemCdk(rawCode) {
     const code = normalizeCode(rawCode);
@@ -243,12 +265,13 @@ export class Store {
       const row = this.db.prepare('SELECT * FROM cdks WHERE code_hash=?').get(hash(code));
       assert(row, '兑换码无效', 404);
       assert(!row.key_id, used, 409);
+      assert(row.voided_at === null, '兑换码已作废，请联系卖家', 410);
       const product = productById(row.product_id); assert(product, '兑换码商品不存在', 500);
       const created = this.insertKey(product.name, product.points, {
         tier: product.tier, validDays: product.validDays, grantNote: '兑换码创建',
         ...(product.staminaPercent === undefined ? {} : { staminaPercent: product.staminaPercent }),
       });
-      const updated = this.db.prepare('UPDATE cdks SET redeemed_at=?, key_id=? WHERE id=? AND key_id IS NULL').run(Date.now(), created.id, row.id);
+      const updated = this.db.prepare('UPDATE cdks SET redeemed_at=?, key_id=? WHERE id=? AND key_id IS NULL AND voided_at IS NULL').run(Date.now(), created.id, row.id);
       assert(updated.changes === 1, used, 409);
       const key = this.key(created.id);
       return { token: created.token, key };

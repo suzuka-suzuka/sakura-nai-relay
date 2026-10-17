@@ -198,6 +198,13 @@ export function createApp(config) {
       assert(typeof body.code === 'string' && body.code.trim(), '请填写兑换码');
       return json(res, 200, store.findCdk(body.code));
     }
+    if (path === '/admin/api/cdks/void' && req.method === 'POST') {
+      const body = parse(await readBody(req, 4096));
+      assert(typeof body.code === 'string' && body.code.trim(), '请填写兑换码');
+      assert(body.disableKey === undefined || typeof body.disableKey === 'boolean', '参数无效');
+      const result = store.voidCdk(body.code, { reason: optionalNote(body.reason) || null, disableKey: body.disableKey === true });
+      return json(res, 200, result);
+    }
     if (path === '/admin/api/password' && req.method === 'POST') {
       allow(`password:${req.socket.remoteAddress}`, 5, 10 * 60000);
       const body = parse(await readBody(req, 4096));
