@@ -256,31 +256,54 @@ export function createApp(config) {
     const current = store.usableKey(keyId);
     assert(current.balance - current.reserved >= amount, `Anlas 不足，本次需要 ${amount} Anlas`, 402);
     let lastError = null, pools = [null];
-    if (key.tier === 'member') {
-      // Read-only discovery does not occupy generation slots. Recheck under the selected account's lock below.
-      let rows;
-      try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(); throw error; }
+    const noteAccount = (pool, id, subscription) => {
+      if (!pool?.expires && !pool?.nonOpus) return;
+      if (pool.expires) {
+        if (Number.isFinite(subscription?.expiresAt)) pool.expires.set(id, subscription.expiresAt);
+        else pool.expires.delete(id);
+      }
+      // Only an active Opus serves small and standard images without Anlas, so every other tier is used first.
+      if (pool.nonOpus) { if (isActiveOpus(subscription)) pool.nonOpus.delete(id); else pool.nonOpus.add(id); }
+    };
+    // Read-only discovery does not occupy generation slots. Recheck under the selected account's lock below.
+    const scan = async (rows, visit) => {
       let cursor = 0;
-      const staminaPool = { scope: 'stamina', ids: new Set(), mode: 'nai5-local-stamina' };
-      const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
-      const anlasPool = { scope: 'anlas', ids: new Set(), mode };
-      const preferFree = amount === 0 || exhaustedNai5;
-      pools = strictStamina ? [staminaPool] : preferFree ? [freePool, anlasPool] : [anlasPool];
       await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
         while (cursor < rows.length && !signal.aborted) {
           const row = rows[cursor++];
           if (editingUpstreams.has(row.id)) continue;
-          try {
-            const subscription = await upstream.subscription(store.upstreamToken(row.id));
-            const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
-            if (strictStamina && hasNai5Allowance(subscription) && estimate === amount && balance >= estimate) staminaPool.ids.add(row.id);
-            if (preferFree && isActiveOpus(subscription) && estimate === 0) freePool.ids.add(row.id);
-            if (balance > 0 && balance >= estimate) anlasPool.ids.add(row.id);
-          } catch (error) { router.failed(row.id, '上游账户查询失败'); lastError = error; }
+          try { visit(row, await upstream.subscription(store.upstreamToken(row.id))); }
+          catch (error) { router.failed(row.id, '上游账户查询失败'); lastError = error; }
         }
       }));
       assert(!signal.aborted, '请求已取消', 499);
       store.usableKey(keyId);
+    };
+    if (key.tier === 'member') {
+      let rows;
+      try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(); throw error; }
+      const staminaPool = { scope: 'stamina', ids: new Set(), mode: 'nai5-local-stamina' };
+      const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
+      const anlasPool = { scope: 'anlas', ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
+      const preferFree = amount === 0 || exhaustedNai5;
+      pools = strictStamina ? [staminaPool] : preferFree ? [freePool, anlasPool] : [anlasPool];
+      await scan(rows, (row, subscription) => {
+        const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
+        if (strictStamina && hasNai5Allowance(subscription) && estimate === amount && balance >= estimate) staminaPool.ids.add(row.id);
+        if (preferFree && isActiveOpus(subscription) && estimate === 0) freePool.ids.add(row.id);
+        if (balance > 0 && balance >= estimate) { anlasPool.ids.add(row.id); noteAccount(anlasPool, row.id, subscription); }
+      });
+    } else {
+      let rows;
+      try { rows = router.available(); } catch (error) { throw error; }
+      if (rows.length > 1) {
+        const pointsPool = { scope: 'pool', ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
+        pools = [pointsPool];
+        await scan(rows, (row, subscription) => {
+          const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
+          if (balance >= estimate) { pointsPool.ids.add(row.id); noteAccount(pointsPool, row.id, subscription); }
+        });
+      }
     }
     for (const pool of pools) {
       const excluded = new Set();
@@ -293,12 +316,13 @@ export function createApp(config) {
         try { selected = await inspect(row.id); }
         catch (error) {
           if (signal.aborted || error.status === 401 || error.code === 'KEY_EXPIRED') throw error;
-          pool?.ids.delete(row.id);
+          pool?.ids.delete(row.id); pool?.expires?.delete(row.id); pool?.nonOpus?.delete(row.id);
           lastError = error; continue;
         }
         try {
           const upstreamEstimate = reservation(path, body, selected.subscription), balance = balanceOf(selected.subscription);
           const funded = balance > 0 && balance >= upstreamEstimate;
+          noteAccount(pool, row.id, selected.subscription);
           const usable = pool?.scope === 'stamina' ? hasNai5Allowance(selected.subscription) && upstreamEstimate === amount && balance >= upstreamEstimate
             : pool?.scope === 'free' ? isActiveOpus(selected.subscription) && upstreamEstimate === 0
             : requireAnlas ? funded : balance >= upstreamEstimate;
@@ -306,10 +330,11 @@ export function createApp(config) {
           // Free eligibility can disappear while queued; the refreshed account may still join the funded pool.
           if (pool?.scope === 'free') {
             const anlasPool = pools.find(p => p?.scope === 'anlas');
-            if (funded) anlasPool.ids.add(row.id); else anlasPool.ids.delete(row.id);
+            if (funded) { anlasPool.ids.add(row.id); noteAccount(anlasPool, row.id, selected.subscription); }
+            else { anlasPool.ids.delete(row.id); anlasPool.expires.delete(row.id); anlasPool.nonOpus.delete(row.id); }
           }
         } catch (error) { selected.unlock(); throw error; }
-        pool?.ids.delete(row.id);
+        pool?.ids.delete(row.id); pool?.expires?.delete(row.id); pool?.nonOpus?.delete(row.id);
         selected.unlock();
       }
     }

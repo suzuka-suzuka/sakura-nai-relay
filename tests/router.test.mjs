@@ -31,7 +31,7 @@ test('全部账号忙时选择最短队列，队列一样长时依次轮询',asy
   controller.abort();await waiting;
 });
 
-test('普通、免费和 Anlas 池各自轮询，查询和跳过候选不推进顺序',t=>{
+test('未指定点数顺序时各池按账号 ID 轮询，查询和跳过候选不推进顺序',t=>{
   const {rows,router}=fixture(t);
   const free={scope:'free',ids:new Set([2,3])},anlas={scope:'anlas',ids:new Set([3,4])};
   assert.equal(router.pick().id,1);
@@ -52,4 +52,18 @@ test('普通、免费和 Anlas 池各自轮询，查询和跳过候选不推进�
   assert.equal(router.pick(new Set(),anlas).id,4);router.commit(4,anlas);
   anlas.ids.add(3);
   assert.equal(router.pick(new Set(),anlas).id,3);
+});
+
+test('点数请求先用非 Opus 账号，Opus 再按到期时间，占用中改用下一个',async t=>{
+  const {router,occupy}=fixture(t);
+  const pool={scope:'anlas',ids:new Set([1,2,3,4]),order:'expiry',expires:new Map([[1,100],[2,900],[3,200],[4,50]]),nonOpus:new Set([2,3])};
+  assert.equal(router.pick(new Set(),pool).id,2);
+  router.commit(2,pool);
+  assert.equal(router.pick(new Set(),pool).id,2);
+  await occupy(2);
+  assert.equal(router.pick(new Set(),pool).id,3);
+  await occupy(3);
+  assert.equal(router.pick(new Set(),pool).id,4);
+  await occupy(4);
+  assert.equal(router.pick(new Set(),pool).id,1);
 });

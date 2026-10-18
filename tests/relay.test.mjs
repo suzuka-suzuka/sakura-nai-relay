@@ -760,17 +760,28 @@ export async function addAccount(f, token, { enabled = true, ...account } = {}) 
 }
 const generatedCalls = f => f.mock.state.calls.filter(c => c.path === '/ai/generate-image');
 
-test('多个空闲上游依次轮询分配，停用上游不参与', async t => {
-  const f = await fixture(t);
-  const second = await addAccount(f, 'pst-second');
-  await addAccount(f, 'pst-disabled-one', { enabled: false });
-  await addAccount(f, 'pst-disabled', { enabled: false });
+test('普通点数请求优先非 Opus 账号，占用中再按 Opus 到期时间换下一个', async t => {
+  const f = await fixture(t), now = Math.floor(Date.now() / 1000);
+  f.mock.state.tier = 3;
+  f.mock.state.expiresAt = now + 86400;
+  const points = await addAccount(f, 'pst-points', { tier: 1, expiresAt: now + 86400 * 30, balance: 10000 });
+  await addAccount(f, 'pst-disabled-points', { enabled: false, tier: 0, expiresAt: now - 86400 });
   f.app.store.adjust(f.key.id, 1000, '测试');
-  for (let i = 0; i < 6; i++) assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
-  const calls = generatedCalls(f);
-  assert.deepEqual(calls.map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-second' : 'Bearer pst-local-test'));
-  assert.ok(f.app.store.jobs().some(j => j.upstream_id === second));
-  assert.equal(f.app.store.key(f.key.id).balance,1100 - 26 * 6);
+  for (let i = 0; i < 3; i++) assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.deepEqual(generatedCalls(f).map(c => c.auth), Array(3).fill('Bearer pst-points'));
+  assert.ok(!f.mock.state.calls.some(c => c.auth === 'Bearer pst-disabled-points' && c.path === '/ai/generate-image'));
+  f.mock.state.accounts.get('pst-points').slow = 150;
+  const other = await (await f.call('/admin/api/keys', 'POST', { name: '另一个用户', points: 100 })).json();
+  const first = f.relay('/ai/generate-image', payload());
+  await waitFor(() => generatedCalls(f).length === 4);
+  const second = f.relay('/ai/generate-image', payload(), { Authorization: 'Bearer ' + other.token });
+  await waitFor(() => generatedCalls(f).length === 5);
+  assert.equal(generatedCalls(f).at(-1).auth, 'Bearer pst-local-test');
+  assert.deepEqual((await Promise.all([first, second])).map(r => r.status), [200, 200]);
+  assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.equal(generatedCalls(f).at(-1).auth, 'Bearer pst-points');
+  assert.ok(f.app.store.jobs().some(j => j.upstream_id === points));
+  assert.equal(f.app.store.key(f.key.id).balance, 1100 - 26 * 5);
 });
 
 test('全部上游额度查询隔离失败；会员本地体力不随账号池变化', async t => {
@@ -1091,14 +1102,17 @@ test('上游拒绝与流式失败自动退款，人工确认接口已移除', as
 
 
 
-test('会员本地体力池的生成不改变普通账号池的轮询顺序', async t => {
-  const f=await fixture(t);f.mock.state.paid=false;await addAccount(f,'pst-second');
+test('会员本地体力轮询不改变点数请求的到期顺序', async t => {
+  const f=await fixture(t),now=Math.floor(Date.now()/1000);
+  f.mock.state.paid=false;f.mock.state.tier=3;f.mock.state.expiresAt=now+86400*30;
+  await addAccount(f,'pst-second',{tier:3,paid:false,expiresAt:now+86400});
   await member(f);
   for(let i=0;i<4;i++)assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
+  assert.deepEqual(generatedCalls(f).map(c=>c.auth),Array.from({length:4},(_,i)=>i%2?'Bearer pst-second':'Bearer pst-local-test'));
   await f.call('/admin/api/keys/'+f.key.id,'POST',{tier:'standard'});
   f.mock.state.calls=[];f.app.store.adjust(f.key.id,1000,'测试');
-  for(let i=0;i<6;i++)assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
-  assert.deepEqual(generatedCalls(f).map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-second' : 'Bearer pst-local-test'));
+  for(let i=0;i<4;i++)assert.equal((await f.relay('/ai/generate-image',payload())).status,200);
+  assert.deepEqual(generatedCalls(f).map(c=>c.auth),Array(4).fill('Bearer pst-second'));
 });
 
 const v45Payload = () => ({ ...payload(), model:'nai-diffusion-4-5-full' });
@@ -1117,19 +1131,23 @@ test('会员非 NAI5 优先有效 Opus，零体力零 Anlas 仍可接免费请�
   assert.equal(f.mock.state.balance,10000); assert.equal(f.mock.state.accounts.get('pst-opus').balance,0);
 });
 
-test('Opus 池独立轮询，普通账号池不受会员轮询影响', async t => {
+test('Opus 池独立轮询，普通点数请求优先非 Opus 账号', async t => {
   const f=await fixture(t); f.mock.state.tier=1; await member(f);
-  await addAccount(f,'pst-opus-a',{tier:3,deltaOverride:0});
-  await addAccount(f,'pst-opus-b',{tier:3,deltaOverride:0});
+  const now=Math.floor(Date.now()/1000);
+  await addAccount(f,'pst-opus-a',{tier:3,deltaOverride:0,expiresAt:now+86400});
+  await addAccount(f,'pst-opus-b',{tier:3,deltaOverride:0,expiresAt:now+86400*30});
   f.mock.state.calls=[];
   for(let i=0;i<6;i++) assert.equal((await f.relay('/ai/generate-image',v45Payload())).status,200);
   assert.deepEqual(generatedCalls(f).map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-opus-b' : 'Bearer pst-opus-a'));
   assert.ok(f.app.store.jobs().every(j=>j.route_mode==='opus-pool' && j.charged===0));
   await f.call('/admin/api/keys/'+f.key.id,'POST',{tier:'standard'}); f.mock.state.calls=[];
   for(let i=0;i<4;i++) assert.equal((await f.relay('/ai/generate-image',v45Payload())).status,200);
-  const calls=generatedCalls(f);
-  assert.deepEqual(calls.map(c=>c.auth),['Bearer pst-local-test','Bearer pst-opus-a','Bearer pst-opus-b','Bearer pst-local-test']);
+  assert.deepEqual(generatedCalls(f).map(c=>c.auth),Array(4).fill('Bearer pst-local-test'));
   assert.equal(f.app.store.key(f.key.id).balance,32);
+  const memberKey=await (await f.call('/admin/api/keys','POST',{name:'续轮询',points:0,tier:'member'})).json();
+  f.mock.state.calls=[];
+  for(let i=0;i<2;i++) assert.equal((await f.relay('/ai/generate-image',v45Payload(),{Authorization:'Bearer '+memberKey.token})).status,200);
+  assert.deepEqual(generatedCalls(f).map(c=>c.auth),['Bearer pst-opus-a','Bearer pst-opus-b']);
 });
 
 test('失效、停用或查询失败的 Opus 不阻止非 Opus 回退，会员报价不变', async t => {
@@ -1147,10 +1165,11 @@ test('失效、停用或查询失败的 Opus 不阻止非 Opus 回退，会员�
 });
 
 test('收费附加项目进入 Anlas 池，可使用非 Opus 并跳过零余额 Opus', async t => {
-  const f=await fixture(t); f.mock.state.tier=1; f.mock.state.cost=22; await member(f);
+  const f=await fixture(t), now=Math.floor(Date.now()/1000);
+  f.mock.state.tier=1; f.mock.state.cost=22; f.mock.state.expiresAt=now+86400*30; await member(f);
   await f.call('/admin/api/upstreams/1','PUT',{name:'普通账号',enabled:true});
-  await addAccount(f,'pst-empty-opus',{tier:3,balance:0});
-  await addAccount(f,'pst-funded-opus',{tier:3,balance:5,cost:5});
+  await addAccount(f,'pst-empty-opus',{tier:3,balance:0,expiresAt:now-86400});
+  await addAccount(f,'pst-funded-opus',{tier:3,balance:5,cost:5,expiresAt:now+86400});
   const request=v45Payload(); request.parameters.director_reference_images=['reference'];
   assert.equal((await f.relay('/ai/generate-image',request)).status,200);
   const job=f.app.store.jobs()[0]; assert.equal(job.upstream_id,1); assert.equal(job.route_mode,'anlas-pool');
@@ -1268,17 +1287,29 @@ test('NAI5 借用其他体力账号仍需下游余额，不能绕过本地报价
 
 
 
-test('Anlas 池仅在余额足够的账号间轮询，不受零余额账号干扰', async t => {
-  const f=await fixture(t); f.mock.state.balance=0; await member(f);
+test('Anlas 池优先非 Opus，占用中改用下一个非 Opus，再按 Opus 到期时间', async t => {
+  const f=await fixture(t), now=Math.floor(Date.now()/1000);
+  f.mock.state.balance=0; f.mock.state.tier=1; f.mock.state.expiresAt=now-86400; await member(f);
   await f.call('/admin/api/upstreams/1','PUT',{name:'零余额账号',enabled:true});
-  await addAccount(f,'pst-funded-a',{tier:1,balance:1000,cost:1});
-  await addAccount(f,'pst-funded-b',{tier:3,balance:1000,cost:1});
+  await addAccount(f,'pst-funded-tablet',{tier:1,balance:1000,cost:1,expiresAt:now+86400*30});
+  await addAccount(f,'pst-funded-points',{tier:0,balance:1000,cost:1,expiresAt:now+86400*40});
+  await addAccount(f,'pst-funded-opus',{tier:3,balance:1000,cost:1,expiresAt:now+86400});
+  const body={model:'nai-diffusion-5-curated',image:canvasPng(832,1216).toString('base64')};
+  const calls=()=>f.mock.state.calls.filter(c=>c.path==='/ai/upscale');
   f.mock.state.calls=[];
-  for(let i=0;i<6;i++) assert.equal((await f.relay('/ai/upscale',{model:'nai-diffusion-5-curated',image:canvasPng(832,1216).toString('base64')})).status,200);
-  const calls=f.mock.state.calls.filter(c=>c.path==='/ai/upscale');
-  assert.deepEqual(calls.map(c=>c.auth),Array.from({length:6},(_,i)=>i%2 ? 'Bearer pst-funded-b' : 'Bearer pst-funded-a'));
+  for(let i=0;i<3;i++) assert.equal((await f.relay('/ai/upscale',body)).status,200);
+  assert.deepEqual(calls().map(c=>c.auth),Array(3).fill('Bearer pst-funded-tablet'));
+  assert.ok(!calls().some(c=>c.auth==='Bearer pst-local-test' || c.auth==='Bearer pst-funded-opus'));
   assert.ok(f.app.store.jobs().every(j=>j.route_mode==='anlas-pool' && j.charged===1));
-  assert.equal(f.app.store.key(f.key.id).balance,94);
+  f.mock.state.accounts.get('pst-funded-tablet').slow=150;
+  const other=await (await f.call('/admin/api/keys','POST',{name:'另一会员',points:10,tier:'member'})).json();
+  const first=f.relay('/ai/upscale',body);
+  await waitFor(()=>calls().length===4);
+  const second=f.relay('/ai/upscale',body,{Authorization:'Bearer '+other.token});
+  await waitFor(()=>calls().length===5);
+  assert.equal(calls().at(-1).auth,'Bearer pst-funded-points');
+  assert.deepEqual((await Promise.all([first,second])).map(r=>r.status),[200,200]);
+  assert.equal(f.app.store.key(f.key.id).balance,96);
 });
 
 test('七天双柱只统计自动成功结算的本地用量，失败不计入上下游消耗', async t => {
