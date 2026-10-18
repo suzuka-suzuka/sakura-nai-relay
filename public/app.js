@@ -22,6 +22,7 @@ const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
 const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', cdks: null, cdkQuery: '', cdkHit: null };
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
+let liveEvents = null, liveRetryTimer = null, settingsDirty = false, snapshotVersion = 0;
 const titles = { overview: '运行概览', keys: '访问密钥', cdks: '兑换码', usage: '用量记录', settings: '上游设置' };
 
 function toast(message, bad = false) {
@@ -33,7 +34,7 @@ async function api(path, options = {}) {
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
   });
   const data = await response.json();
-  if (!response.ok) { if (response.status === 401 && state.data && !path.includes('password')) { state.data = null; await init(); } throw new Error(data.error || '请求失败'); }
+  if (!response.ok) { if (response.status === 401 && state.data && !path.includes('password')) { stopEvents(); state.data = null; await init(); } throw new Error(data.error || '请求失败'); }
   return data;
 }
 async function withButton(button, fn) {
@@ -249,12 +250,75 @@ async function loadCdks() {
 function renderView() {
   $('#view').innerHTML = ({ overview, keys: keysView, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
-  if (state.view === 'cdks') void loadCdks();
+  if (state.view === 'cdks' && !state.cdks) void loadCdks();
 }
-async function refresh() { state.data = await api('/snapshot'); state.keyMatches = null; state.keySearchError = ''; shell(); }
+function stopEvents() { clearTimeout(liveRetryTimer); liveRetryTimer = null; liveEvents?.close(); liveEvents = null; snapshotVersion++; }
+function updateQuota(data) {
+  if (state.quota && state.quota.fetchedAt > data.fetchedAt) return;
+  state.quota = data; state.quotaError = '';
+  const panel = $('.quota-panel'); if (panel) panel.outerHTML = quotaPanel();
+  const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
+}
+function applySnapshot(data) {
+  const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
+  if (!previous) { settingsDirty = false; shell(); return; }
+  const count = $('.nav-item[href="#keys"] small'); if (count) count.textContent = data.keys.length;
+  const connection = $('.connection-state');
+  if (connection) {
+    $('i', connection).classList.toggle('online', data.settings.configured && data.settings.enabled);
+    $('div', connection).textContent = data.settings.configured ? data.settings.enabled ? '中转已启用' : '中转已暂停' : '未配置上游';
+  }
+  const view = $('#view'); if (!view) return;
+  const focused = document.activeElement, selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart, focused.selectionEnd] : null;
+  const scrolls = Array.from(view.querySelectorAll('.table-scroll'), node => [node.scrollLeft, node.scrollTop]);
+  if (state.view === 'keys') {
+    const count = $('.count', view); if (count) count.textContent = data.keys.length;
+    $('#key-table').innerHTML = keyTable(filteredKeys());
+    // Balance and job updates do not invalidate a hidden-token search.
+    const identity = keys => JSON.stringify(keys.map(key => [key.id, key.name, key.prefix]));
+    if (state.filter.trim() && identity(previous.keys) !== identity(data.keys)) void searchKeys();
+  } else {
+    const preserved = state.view === 'settings' && settingsDirty ? $('#settings-form') : state.view === 'cdks' ? $('#cdk-search-form') : null;
+    view.innerHTML = ({ overview, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
+    if (preserved) $('#'+preserved.id).replaceWith(preserved);
+  }
+  if (focused && view.contains(focused)) { focused.focus({ preventScroll: true }); if (selection) focused.setSelectionRange(...selection); }
+  view.querySelectorAll('.table-scroll').forEach((node, index) => { if (scrolls[index]) [node.scrollLeft, node.scrollTop] = scrolls[index]; });
+}
+function startEvents() {
+  if (liveEvents || !state.data || !state.csrf) return;
+  const source = liveEvents = new EventSource('/admin/api/events');
+  source.addEventListener('snapshot', event => { if (liveEvents === source) applySnapshot(JSON.parse(event.data)); });
+  source.addEventListener('quota', event => { if (liveEvents === source) updateQuota(JSON.parse(event.data)); });
+  source.addEventListener('session-expired', () => {
+    if (liveEvents !== source) return;
+    stopEvents(); state.data = null; state.csrf = null; state.quota = null; closeModal();
+    void init().catch(error => toast(error.message, true));
+  });
+  source.onerror = () => {
+    // EventSource reconnects automatically; status also detects expiry while offline.
+    if (liveEvents !== source) return;
+    if (source.readyState === EventSource.CLOSED && !liveRetryTimer) {
+      liveRetryTimer = setTimeout(() => {
+        liveRetryTimer = null;
+        if (liveEvents !== source) return;
+        source.close(); liveEvents = null; startEvents();
+      }, 3000);
+    }
+    void api('/status').then(result => {
+      if (liveEvents !== source || result.loggedIn) return;
+      stopEvents(); state.data = null; state.csrf = null; state.quota = null; closeModal(); login(result.initialized);
+    }).catch(() => {});
+  };
+}
+async function refresh() {
+  const version = snapshotVersion, data = await api('/snapshot');
+  if (version === snapshotVersion) { state.data = data; state.cdks = data.cdks; state.keyMatches = null; state.keySearchError = ''; cdkVersion++; shell(); }
+  startEvents();
+}
 async function quota() {
   state.quotaError = '';
-  try { state.quota = await api('/quota'); } catch (error) { state.quota = null; state.quotaError = error.message; }
+  try { updateQuota(await api('/quota')); } catch (error) { state.quotaError = error.message; }
   // Preserve unsaved settings inputs when refreshing quota.
   const panel = $('.quota-panel'); if (panel) panel.outerHTML = quotaPanel();
   const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
@@ -320,7 +384,7 @@ document.addEventListener('click', async event => {
     if (action === 'refresh') { await refresh(); if (state.data.settings.configured) await quota(); }
     if (action === 'quota') await quota();
     if (action === 'toggle-upstream') { const row = state.data.upstreams.find(u => u.id === Number(id)); await api('/upstreams/'+id, { method:'PUT', body:{ name:row.name, enabled:!row.enabled } }); await refresh(); toast(row.enabled ? '上游已停用' : '上游已启用'); }
-    if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); await quota(); toast('上游已移除'); }
+    if (action === 'confirm-remove-upstream') { await api('/upstreams/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('上游已移除'); }
     if (action === 'confirm-remove-key') { await api('/keys/'+id, { method:'DELETE' }); closeModal(); await refresh(); toast('密钥已删除，历史记录已保留'); }
     if (action === 'copy-url') await copy(state.data.relayUrl, $('.address-field code'));
     if (action === 'copy-redeem-url') await copy($('#redeem-url').textContent, $('#redeem-url'));
@@ -332,17 +396,23 @@ document.addEventListener('click', async event => {
     }
     if (action === 'copy-key') { const token = $('#new-token'); await copy(token.textContent, token); }
     if (action === 'toggle-key') { const key = state.data.keys.find(k => k.id === Number(id)); await api(`/keys/${id}`, { method: 'POST', body: { enabled: !key.enabled } }); closeModal(); await refresh(); toast(key.enabled ? '密钥已停用' : '密钥已启用'); }
-    if (action === 'logout') { await api('/logout', { method: 'POST', body: {} }); state.data = null; state.csrf = null; state.quota = null; await init(); }
+    if (action === 'logout') {
+      stopEvents();
+      try { await api('/logout', { method: 'POST', body: {} }); }
+      catch (error) { startEvents(); throw error; }
+      state.data = null; state.csrf = null; state.quota = null; closeModal(); await init();
+    }
   });
 });
 document.addEventListener('input', event => {
+  if (event.target.closest?.('#settings-form')) settingsDirty = true;
   if (event.target.id !== 'key-search') return;
   clearTimeout(keySearchTimer); keySearchVersion++;
   state.filter = event.target.value; state.keyMatches = null; state.keySearchError = '';
   $('#key-table').innerHTML = keyTable(filteredKeys());
   if (state.filter.trim()) keySearchTimer = setTimeout(searchKeys, 200);
 });
-document.addEventListener('change', event => { if (event.target.closest('#key-form')) syncKeyForm(); });
+document.addEventListener('change', event => { if (event.target.closest('#key-form')) syncKeyForm(); if (event.target.closest('#settings-form')) settingsDirty = true; });
 document.addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target, button = $('button[type="submit"]', form), values = Object.fromEntries(new FormData(form));
   const errorNode = $('.form-error', form); if (errorNode) errorNode.textContent = '';
@@ -350,7 +420,7 @@ document.addEventListener('submit', async event => {
     try {
       if (form.id === 'auth-form') {
         if (form.dataset.setup === 'true' && values.confirm !== values.password) throw new Error('两次输入的密码不一致');
-        const result = await api(form.dataset.setup === 'true' ? '/setup' : '/login', { method: 'POST', body: values }); state.csrf = result.csrf; await refresh(); if (state.data.settings.configured) await quota();
+        const result = await api(form.dataset.setup === 'true' ? '/setup' : '/login', { method: 'POST', body: values }); state.csrf = result.csrf; await refresh();
       }
       if (form.id === 'key-form') {
         const body = { name: values.name, tier: values.tier };
@@ -365,9 +435,9 @@ document.addEventListener('submit', async event => {
         modal('密钥已创建', `<div class="success-mark">${icon('check')}</div><code id="new-token" class="token-display">${e(result.token)}</code><div class="key-connect"><span>连接地址</span><code>${e(state.data.relayUrl)}</code></div><div class="modal-actions"><button class="button subtle" data-action="close">关闭</button><button class="button primary" data-action="copy-key">${icon('copy')}复制密钥</button></div>`);
       }
       if (form.id === 'points-form') { await api(`/keys/${form.dataset.id}/points`, { method: 'POST', body: { delta: Number(values.delta), note: values.note } }); closeModal(); await refresh(); toast('Anlas 已调整，流水已记录'); }
-      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); await quota(); toast('上游已保存'); }
+      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); toast('上游已保存'); }
       if (form.id === 'settings-form') {
-        await api('/settings', { method: 'PUT', body: { enabled: values.enabled === 'on', origins: values.origins.split('\n').map(x => x.trim()).filter(Boolean) } }); await refresh(); await quota(); toast('设置已保存');
+        await api('/settings', { method: 'PUT', body: { enabled: values.enabled === 'on', origins: values.origins.split('\n').map(x => x.trim()).filter(Boolean) } }); settingsDirty = false; await refresh(); toast('设置已保存');
       }
       if (form.id === 'cdk-search-form') {
         state.cdkQuery = String(values.code || '');
@@ -387,18 +457,22 @@ document.addEventListener('submit', async event => {
       }
       if (form.id === 'password-form') {
         if (values.password !== values.confirm) throw new Error('两次输入的密码不一致');
-        const result = await api('/password', { method: 'POST', body: values }); state.csrf = result.csrf; closeModal(); toast('管理员密码已更新，其他会话已退出');
+        stopEvents();
+        try { const result = await api('/password', { method: 'POST', body: values }); state.csrf = result.csrf; closeModal(); toast('管理员密码已更新，其他会话已退出'); }
+        finally { startEvents(); }
       }
     } catch (error) { if (errorNode?.isConnected) errorNode.textContent = error.message; else throw error; }
   });
 });
 $('#dialog').addEventListener('click', event => { if (event.target === $('#dialog')) { const r = event.target.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) closeModal(); } });
 $('#dialog').addEventListener('close', () => { $('#dialog').innerHTML = ''; });
-window.addEventListener('hashchange', () => { const view = location.hash.slice(1); state.view = titles[view] ? view : 'overview'; if (state.data) shell(); });
+window.addEventListener('hashchange', () => { const view = location.hash.slice(1); state.view = titles[view] ? view : 'overview'; settingsDirty = false; if (state.data) shell(); });
+window.addEventListener('pagehide', stopEvents);
+window.addEventListener('pageshow', () => { if (state.data) startEvents(); });
 async function init() {
   const result = await api('/status'); state.csrf = result.csrf;
-  if (!result.loggedIn) return login(result.initialized);
+  if (!result.loggedIn) { stopEvents(); return login(result.initialized); }
   state.view = titles[location.hash.slice(1)] ? location.hash.slice(1) : 'overview';
-  await refresh(); if (state.data.settings.configured) await quota();
+  await refresh();
 }
 init().catch(error => { $('#app').innerHTML = `<div class="boot"><h2>暂时无法打开控制台</h2><p>${e(error.message)}</p><button class="button primary" data-action="reload">重新加载</button></div>`; $('[data-action="reload"]').addEventListener('click', () => location.reload()); });

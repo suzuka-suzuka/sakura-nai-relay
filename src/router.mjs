@@ -42,14 +42,17 @@ export class UpstreamRouter {
     return () => { this.activeKeys.delete(id); unlock(); };
   }
   async lockUpstream(id, signal) {
-    const unlock = await this.upstreamQueue.enter(id, signal); this.busy.add(id);
-    return () => { this.busy.delete(id); unlock(); };
+    const pending = this.upstreamQueue.enter(id, signal); this.onChange?.();
+    let unlock;
+    try { unlock = await pending; } catch (error) { this.onChange?.(); throw error; }
+    this.busy.add(id); this.onChange?.();
+    return () => { this.busy.delete(id); unlock(); this.onChange?.(); };
   }
   commit(id, pool = null) {
     // Advance only when dispatching generation, so reads and skipped accounts do not consume turns.
     this.cursors.set(pool?.scope ?? 'pool', id);
   }
-  failed(id, error, seconds = 30) { this.cooldowns.set(id, { until: Date.now() + seconds * 1000, error }); }
-  reset(id) { this.cooldowns.delete(id); }
+  failed(id, error, seconds = 30) { this.cooldowns.set(id, { until: Date.now() + seconds * 1000, error }); this.onChange?.(); }
+  reset(id) { this.cooldowns.delete(id); this.onChange?.(); }
   close() { this.keyQueue.close(); this.upstreamQueue.close(); }
 }

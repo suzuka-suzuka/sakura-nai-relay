@@ -12,6 +12,7 @@ import { UpstreamRouter } from './router.mjs';
 import { imageSize, base64Size } from './image-size.mjs';
 import { parseJson as parse, parseMultipart, imagePart, validateGenerationParts, replaceMultipartRequest, validateInpaintingImages } from './multipart.mjs';
 import { encodeStreamEvent } from './msgpack.mjs';
+import { adminEvents } from './admin-events.mjs';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const PAID = new Set(['/ai/generate-image', '/ai/generate-image-stream', '/ai/encode-vibe', '/ai/augment-image', '/ai/upscale']);
@@ -53,6 +54,26 @@ export function createApp(config) {
     res.setHeader('Set-Cookie', `sakura_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${config.cookieSecure ? '; Secure' : ''}`);
     return csrf;
   }
+  function snapshot() {
+    const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
+    const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
+    return { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys().map(key => ({ ...key, expired: key.expires_at !== null && key.expires_at <= Date.now() })), jobs: store.jobs(), ledger: store.ledger(), stats, trend, cdks: { products: store.cdkSummary(), redemptions: store.cdkRedemptions() }, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` };
+  }
+  async function readQuota() {
+    const rows = store.upstreams(), results = new Array(rows.length); let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
+      while (cursor < rows.length) {
+        const index = cursor++, row = rows[index];
+        try {
+          const data = await upstream.subscription(store.upstreamToken(row.id));
+          results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: true, account: upstreamSubscription(data) };
+        } catch { results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: false, error: '额度查询失败，请检查 Key 或稍后重试' }; }
+      }
+    }));
+    return { upstreams: results, totalAnlas: results.reduce((sum, r) => sum + (r.ok ? r.account.relay.balance : 0), 0), failed: results.filter(r => !r.ok).length, fetchedAt: Date.now() };
+  }
+  const events = adminEvents({ snapshot, session, quota: readQuota });
+  store.onChange = events.changed; router.onChange = events.changed;
   async function admin(req, res, path) {
     if (req.method !== 'GET') assert(req.headers.origin === config.publicOrigin, '请求来源不匹配，请检查 PUBLIC_ORIGIN', 403);
     if (path === '/admin/api/status' && req.method === 'GET') {
@@ -76,27 +97,21 @@ export function createApp(config) {
     if (req.method !== 'GET') assert(equal(req.headers['x-csrf-token'], s.csrf), '会话校验失败，请刷新页面', 403);
     if (path === '/admin/api/logout' && req.method === 'POST') {
       store.db.prepare('DELETE FROM sessions WHERE token_hash=?').run(s.token_hash);
+      events.revalidate();
       res.setHeader('Set-Cookie', 'sakura_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
       return json(res, 200, { ok: true });
     }
     if (path === '/admin/api/snapshot' && req.method === 'GET') {
-      const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
-      const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
-      return json(res, 200, { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys(), jobs: store.jobs(), ledger: store.ledger(), stats, trend, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` });
+      return json(res, 200, snapshot());
+    }
+    if (path === '/admin/api/events' && req.method === 'GET') {
+      assert(!req.headers.origin || req.headers.origin === config.publicOrigin, '请求来源不匹配', 403);
+      assert(!req.headers['sec-fetch-site'] || req.headers['sec-fetch-site'] === 'same-origin', '请求来源不匹配', 403);
+      return events.connect(req, res, s);
     }
     if (path === '/admin/api/quota' && req.method === 'GET') {
       allow('admin-quota', 20);
-      const rows = store.upstreams(), results = new Array(rows.length); let cursor = 0;
-      await Promise.all(Array.from({ length: Math.min(rows.length, 4) }, async () => {
-        while (cursor < rows.length) {
-          const index = cursor++, row = rows[index];
-          try {
-            const data = await upstream.subscription(store.upstreamToken(row.id));
-            results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: true, account: upstreamSubscription(data) };
-          } catch { results[index] = { id: row.id, name: row.name, enabled: !!row.enabled, ok: false, error: '额度查询失败，请检查 Key 或稍后重试' }; }
-        }
-      }));
-      return json(res, 200, { upstreams: results, totalAnlas: results.reduce((sum, r) => sum + (r.ok ? r.account.relay.balance : 0), 0), failed: results.filter(r => !r.ok).length, fetchedAt: Date.now() });
+      return json(res, 200, await readQuota());
     }
     const upstreamMatch = /^\/admin\/api\/upstreams(?:\/(\d+))?$/.exec(path);
     if (upstreamMatch && ['POST', 'PUT', 'DELETE'].includes(req.method)) {
@@ -211,6 +226,7 @@ export function createApp(config) {
       assert(verifyPassword(body.current, store.get('admin_password')), '当前密码不正确', 401);
       assert(typeof body.password === 'string' && body.password.length >= 12 && body.password.length <= 256, '新密码需为 12–256 个字符');
       store.transaction(() => { store.set('admin_password', passwordHash(body.password)); store.db.exec('DELETE FROM sessions'); });
+      events.revalidate();
       return json(res, 200, { csrf: issueSession(res) });
     }
     throw new HttpError(404, '管理接口不存在');
@@ -420,7 +436,7 @@ export function createApp(config) {
         return;
       }
       throw error;
-    } finally { selected?.unlock(); unlockKey?.(); res.off('close', onClose); }
+    } finally { selected?.unlock(); unlockKey?.(); res.off('close', onClose); if (jobId) void events.refreshQuota(); }
   }
 
   const server = createServer(async (req, res) => {
@@ -432,7 +448,11 @@ export function createApp(config) {
     if (config.cookieSecure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
     try {
       const url = new URL(req.url, config.publicOrigin), path = url.pathname;
-      if (path.startsWith('/admin/api/')) return await admin(req, res, path);
+      if (path.startsWith('/admin/api/')) {
+        const result = await admin(req, res, path);
+        if (res.statusCode >= 200 && res.statusCode < 300 && ['POST', 'PUT', 'DELETE'].includes(req.method) && (path.startsWith('/admin/api/upstreams') || path === '/admin/api/settings')) void events.refreshQuota();
+        return result;
+      }
       const accountRoute = path === '/user/subscription' || path === '/ai/user/subscription' || path === '/user/data';
       const relayRoute = accountRoute || path === '/ai/generate-image/suggest-tags' || PAID.has(path);
       if (relayRoute) {
@@ -487,5 +507,9 @@ export function createApp(config) {
     }
   });
   server.requestTimeout = 30000; server.headersTimeout = 15000; server.maxHeadersCount = 50;
-  return { server, store, router, isBusy: () => router.busy.size > 0, close: async () => { router.close(); await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); }); store.close(); } };
+  return { server, store, router, isBusy: () => router.busy.size > 0, close: async () => {
+    router.close();
+    const stopped = new Promise(resolve => server.close(resolve));
+    await events.close(); server.closeIdleConnections(); await stopped; store.close();
+  } };
 }

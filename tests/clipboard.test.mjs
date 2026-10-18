@@ -57,7 +57,7 @@ async function fixture({ clipboard, modal = true, legacy = true } = {}) {
   const context = createContext({
     document, navigator: { clipboard }, window: { addEventListener() {} }, location: { hash: '' },
     fetch: async () => ({ ok: true, json: async () => ({ initialized: true, loggedIn: false }) }),
-    setTimeout() {},
+    setTimeout() {}, clearTimeout() {},
   });
   runInContext(appSource, context);
   await Promise.resolve();

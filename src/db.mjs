@@ -94,8 +94,12 @@ export class Store {
     }
   }
   get(name) { return this.db.prepare('SELECT value FROM settings WHERE name=?').get(name)?.value ?? null; }
-  set(name, value) { this.db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name, value); }
-  transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (error) { this.db.exec('ROLLBACK'); throw error; } }
+  set(name, value) { this.db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value').run(name, value); this.onChange?.(); }
+  transaction(fn) {
+    this.db.exec('BEGIN IMMEDIATE'); let result;
+    try { result = fn(); this.db.exec('COMMIT'); } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    this.onChange?.(); return result;
+  }
   upstreams() {
     return this.db.prepare('SELECT id,name,suffix,enabled,created_at FROM upstreams WHERE retired_at IS NULL ORDER BY id').all();
   }
@@ -145,6 +149,7 @@ export class Store {
     if (key.tier !== 'member' || period <= key.stamina_refill_period) return key;
     this.db.prepare(`UPDATE keys SET stamina_balance=MIN(stamina_capacity,stamina_balance+?),stamina_refill_period=?
       WHERE id=? AND stamina_refill_period=? AND retired_at IS NULL`).run((period-key.stamina_refill_period)*dailyFor(key.stamina_capacity),period,key.id,key.stamina_refill_period);
+    this.onChange?.();
     return this.key(key.id);
   }
   usableKey(id) {
