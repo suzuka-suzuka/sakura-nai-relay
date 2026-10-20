@@ -347,16 +347,35 @@ function removeKey(id) {
   const key = state.data.keys.find(k => k.id === Number(id)); if (!key) return;
   modal('删除访问密钥', `<p class="muted">确认删除「${e(key.name)}」？</p><code class="token-display">${e(key.prefix)}</code><p class="muted">删除后密钥立即失效并从列表移除，剩余 ${number(key.balance)} Anlas 不再可用。已有请求记录和 Anlas 流水会保留，此操作无法撤销。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-key" data-id="${key.id}">确认删除</button></div>`);
 }
-function jobDetail(id) {
+function jobDiagnosticsView(d) {
+  if (!d) return '<p class="field-note">此记录未保存诊断信息；更新后提交的请求会自动记录。</p>';
+  const section = (title, text) => `<section class="diagnostic-section"><h3>${e(title)}</h3><pre class="diagnostic-text">${e(text)}</pre></section>`;
+  let request = d.request_json;
+  try { if (request) request = JSON.stringify(JSON.parse(request), null, 2); } catch { /* Display older text as saved. */ }
+  return (d.response_content_type ? '<p class="field-note">上游响应类型：'+e(d.response_content_type)+'</p>' : '') +
+    (d.upstream_error !== null ? section('NovelAI 错误原文（已脱敏）', d.upstream_error || '[上游返回空响应]') : '') +
+    (d.failure_detail ? section('中断 / 解析原因', d.failure_detail) : '') +
+    (request ? section('请求参数（图片与密钥已脱敏）', request) : '');
+}
+async function jobDetail(id) {
   const j = state.data.jobs.find(j => j.id === id); if (!j) return;
   const mode = ({pool:'账号池', 'opus-pool':'Opus 免费池', 'anlas-pool':'Anlas 余额池', 'nai5-local-stamina':'V5 本地体力池', 'nai5-bound':'旧会员绑定上游', 'nai5-paid-pool':'NAI5 体力耗尽 · Anlas 池', 'nai5-stamina-pool':'NAI5 体力池 · 下游扣点'})[j.route_mode];
   modal('请求详情', '<dl class="details"><dt>请求编号</dt><dd><code>'+e(j.id)+'</code></dd>'+
     '<dt>访问密钥</dt><dd>'+e(j.key_name)+'</dd><dt>计费等级</dt><dd>'+tierName(j.tier_snapshot)+'</dd>'+
     '<dt>所用上游</dt><dd>'+e(j.upstream_name)+'</dd><dt>路由方式</dt><dd>'+e(mode)+'</dd>'+
+    '<dt>请求接口</dt><dd><code>'+e(j.endpoint)+'</code></dd><dt>上游 HTTP 状态</dt><dd>'+e(j.http_status ?? '—')+'</dd>'+
     '<dt>状态</dt><dd>'+badge(j.status)+'</dd><dt>本地报价</dt><dd>'+number(j.reserved)+' Anlas</dd>'+
     '<dt>上游消耗</dt><dd>'+number(j.upstream_spent)+' Anlas</dd>'+
     '<dt>体力消耗</dt><dd>'+(j.stamina_charged === null ? '—' : number(j.stamina_charged/100)+' 张')+'</dd><dt>实际扣点</dt><dd>'+(j.charged === null ? '处理中' : number(j.charged)+' Anlas')+'</dd></dl><p class="info-box">'+e(j.note)+'</p>'+
+    '<div id="job-diagnostics"><p class="field-note">正在读取诊断信息…</p></div>'+
     '<div class="modal-actions"><button class="button subtle" data-action="close">关闭</button></div>');
+  const container = $('#job-diagnostics');
+  try {
+    const result = await api('/jobs/' + encodeURIComponent(id));
+    if (container?.isConnected) container.innerHTML = jobDiagnosticsView(result.diagnostics);
+  } catch (error) {
+    if (container?.isConnected) container.innerHTML = '<p class="field-note">诊断信息读取失败：'+e(error.message)+'</p>';
+  }
 }
 
 document.addEventListener('click', async event => {

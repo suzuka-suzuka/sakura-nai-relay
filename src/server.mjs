@@ -13,6 +13,7 @@ import { imageSize, base64Size } from './image-size.mjs';
 import { parseJson as parse, parseMultipart, imagePart, validateGenerationParts, replaceMultipartRequest, validateInpaintingImages } from './multipart.mjs';
 import { encodeStreamEvent } from './msgpack.mjs';
 import { adminEvents } from './admin-events.mjs';
+import { requestDiagnostics, redactDiagnosticText, failureDiagnostics, diagnosticSecrets } from './request-diagnostics.mjs';
 
 const PUBLIC = fileURLToPath(new URL('../public/', import.meta.url));
 const PAID = new Set(['/ai/generate-image', '/ai/generate-image-stream', '/ai/encode-vibe', '/ai/augment-image', '/ai/upscale']);
@@ -103,6 +104,11 @@ export function createApp(config) {
     }
     if (path === '/admin/api/snapshot' && req.method === 'GET') {
       return json(res, 200, snapshot());
+    }
+    if (path.startsWith('/admin/api/jobs/') && req.method === 'GET') {
+      const id = path.slice('/admin/api/jobs/'.length);
+      assert(store.db.prepare('SELECT id FROM jobs WHERE id=?').get(id), '请求记录不存在', 404);
+      return json(res, 200, { diagnostics: store.jobDiagnostics(id) });
     }
     if (path === '/admin/api/events' && req.method === 'GET') {
       assert(!req.headers.origin || req.headers.origin === config.publicOrigin, '请求来源不匹配', 403);
@@ -346,7 +352,8 @@ export function createApp(config) {
   async function paid(req, res, path, key) {
     const waiting = new AbortController();
     const onClose = () => waiting.abort(); res.once('close', onClose);
-    let jobId = null, status = null, selected = null, unlockKey = null, msgpack = false;
+    let jobId = null, status = null, selected = null, unlockKey = null, msgpack = false, streamCheck = null;
+    const secrets = [req.headers.authorization?.replace(/^Bearer\s+/i, '')];
     try {
       const raw = await readBody(req, MAX_BODY);
       let type = req.headers['content-type'] ?? '';
@@ -396,15 +403,19 @@ export function createApp(config) {
       assert(!waiting.signal.aborted, '请求已取消', 499);
       assert(options().enabled, '中转已暂停', 503);
       const { token, amount, stamina, upstreamEstimate, mode } = selected;
+      secrets.push(token, ...diagnosticSecrets(body));
       const id = random().slice(0, 18);
       store.reserve(key.id,id,path,body.model ?? body.req_type ?? 'image-tool',amount,idempotency,selected.id,{ mode,upstreamEstimate,stamina });
       jobId = id;
+      store.saveJobDiagnostics(id, { request: await requestDiagnostics(body, form, secrets) });
       res.setHeader('X-Request-Id', id);
       router.commit(selected.id, selected.pool);
       const response = await upstream.request(path, token, { method: 'POST', headers: { 'Content-Type': type, Accept: streaming ? 'text/event-stream' : req.headers.accept ?? 'application/zip, application/json' }, body: payload });
       status = response.status;
+      store.saveJobDiagnostics(id, { contentType: response.headers.get('content-type') });
       if (!response.ok) {
-        await readBounded(response, 1024 * 1024); // Never expose upstream error bodies or secrets.
+        const detail = await readBounded(response, 1024 * 1024);
+        store.saveJobDiagnostics(id, { upstreamError: redactDiagnosticText(detail.toString('utf8'), secrets) });
         if (status === 429) {
           store.fail(id, '上游限流，未扣 Anlas', status);
           router.failed(selected.id, '上游限流，稍后自动参与路由', 3);
@@ -420,6 +431,7 @@ export function createApp(config) {
       if (streaming) {
         assert(contentType.includes('text/event-stream'), '上游未返回预期 SSE 流', 502);
         const frames = [], check = new StreamCheck(body.parameters.n_samples, msgpack ? event => frames.push(encodeStreamEvent(event)) : null);
+        streamCheck = check;
         if (!res.destroyed) { res.writeHead(status, { 'Content-Type': msgpack ? 'application/x-msgpack' : contentType, 'X-Accel-Buffering': 'no' }); res.flushHeaders(); }
         const forward = async chunk => {
           if (!res.destroyed && !res.write(chunk)) await new Promise(resolve => {
@@ -443,6 +455,8 @@ export function createApp(config) {
         if (contentType.includes('application/json')) {
           try { const value = JSON.parse(result); complete = Array.isArray(value.images) && value.images.length === (body.parameters?.n_samples ?? (body.req_type === 'bg-removal' ? 3 : 1)) && value.images.every(i => i.image); } catch { complete = false; }
         } else if (path !== '/ai/encode-vibe') complete &&= contentType.startsWith('image/') || result.subarray(0, 2).toString() === 'PK';
+        if (!complete && (contentType.includes('json') || contentType.startsWith('text/')))
+          store.saveJobDiagnostics(id, { upstreamError: redactDiagnosticText(result.toString('utf8'), secrets) });
       }
       assert(complete, '上游未返回完整生成结果，任务失败，未扣点数', 502);
       store.settle(id, amount, 'completed', amount ? '按密钥等级的本地报价结算' : '会员免费权益，未扣点数', status);
@@ -451,6 +465,8 @@ export function createApp(config) {
         else res.end();
       }
     } catch (error) {
+      if (jobId) store.saveJobDiagnostics(jobId, { failure: failureDiagnostics(error, streamCheck, secrets),
+        upstreamError: streamCheck?.upstreamError ? redactDiagnosticText(streamCheck.upstreamError, secrets) : null });
       const transportCode = error.cause?.code ?? error.code;
       const networkCode = typeof transportCode === 'string' && /^(UND_ERR_[A-Z_]+|E[A-Z]+)$/.test(transportCode) ? transportCode : null;
       if (jobId) store.fail(jobId, `请求超时、中断或结果不完整${networkCode ? `（${networkCode}）` : ''}，任务失败，已释放预留点数`, status);

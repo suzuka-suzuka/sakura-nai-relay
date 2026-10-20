@@ -128,7 +128,7 @@ export function quoteRequest(path, body, key) {
 
 /** Validate upstream SSE before settlement; optionally expose parsed events to a client encoder. */
 export class StreamCheck {
-  constructor(expected, onEvent = null) { this.expected = expected; this.onEvent = onEvent; this.buffer = ''; this.decoder = new TextDecoder(); this.finals = new Set(); this.failed = false; }
+  constructor(expected, onEvent = null) { this.expected = expected; this.onEvent = onEvent; this.buffer = ''; this.decoder = new TextDecoder(); this.finals = new Set(); this.failed = false; this.upstreamError = null; }
   feed(bytes) {
     this.buffer += this.decoder.decode(bytes, { stream: true });
     assert(this.buffer.length < 64 * 1024 * 1024, '上游流式事件过大', 502);
@@ -140,12 +140,14 @@ export class StreamCheck {
   record(record) {
     const lines = record.split(/\r?\n/), kind = lines.find(l => l.startsWith('event:'))?.slice(6).trim();
     const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
+    const saveError = () => { this.failed = true; this.upstreamError ??= record.length > 128 * 1024 ? record.slice(0, 128 * 1024) + '\n[内容超过 128 KiB，已截断]' : record; };
+    if (kind === 'error') saveError();
     if (!data || data === '[DONE]') return;
     let parsed;
     try { parsed = JSON.parse(data); } catch { this.failed = true; return; }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { this.failed = true; return; }
     const type = parsed.event_type ?? kind;
-    if (type === 'error' || parsed.error) this.failed = true;
+    if (type === 'error' || parsed.error) saveError();
     if (type === 'final') {
       if (!Number.isInteger(parsed.samp_ix) || parsed.samp_ix < 0 || parsed.samp_ix >= this.expected || !parsed.image) this.failed = true;
       else this.finals.add(parsed.samp_ix);

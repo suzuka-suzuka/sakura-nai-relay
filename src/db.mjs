@@ -57,6 +57,9 @@ export class Store {
         kind TEXT NOT NULL, note TEXT NOT NULL, job_id TEXT, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS jobs_time ON jobs(created_at DESC);
       CREATE INDEX IF NOT EXISTS ledger_time ON ledger(created_at DESC);`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS job_diagnostics (
+      job_id TEXT PRIMARY KEY REFERENCES jobs(id), request_json TEXT,
+      upstream_error TEXT, failure_detail TEXT, response_content_type TEXT);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS upstreams (
       id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
       suffix TEXT NOT NULL,
@@ -342,6 +345,14 @@ export class Store {
     if (this.db.prepare("SELECT id FROM jobs WHERE id=? AND status='running'").get(id)) this.settle(id, 0, 'failed', note, http);
   }
   jobs(limit = 100) { return this.db.prepare('SELECT jobs.*,keys.name AS key_name FROM jobs JOIN keys ON keys.id=jobs.key_id ORDER BY jobs.rowid DESC LIMIT ?').all(limit); }
+  saveJobDiagnostics(id, { request = null, upstreamError = null, failure = null, contentType = null } = {}) {
+    this.db.prepare(`INSERT INTO job_diagnostics(job_id,request_json,upstream_error,failure_detail,response_content_type) VALUES(?,?,?,?,?)
+      ON CONFLICT(job_id) DO UPDATE SET request_json=COALESCE(excluded.request_json,request_json),
+      upstream_error=COALESCE(excluded.upstream_error,upstream_error),failure_detail=COALESCE(excluded.failure_detail,failure_detail),
+      response_content_type=COALESCE(excluded.response_content_type,response_content_type)`)
+      .run(id, request === null ? null : JSON.stringify(request), upstreamError, failure, contentType);
+  }
+  jobDiagnostics(id) { return this.db.prepare('SELECT * FROM job_diagnostics WHERE job_id=?').get(id) ?? null; }
   ledger(limit = 100) { return this.db.prepare('SELECT ledger.*,keys.name AS key_name FROM ledger JOIN keys ON keys.id=ledger.key_id WHERE ledger.delta != 0 ORDER BY ledger.id DESC LIMIT ?').all(limit); }
   close() { this.db.close(); }
 }
