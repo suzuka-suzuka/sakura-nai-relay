@@ -127,10 +127,6 @@ function upstreamBadge(row) {
   const [text, color] = !row.enabled ? ['已停用', 'muted'] : row.busy ? ['生成中', 'pink'] : row.cooldownUntil > Date.now() ? ['冷却中', 'amber'] : ['已启用', 'green'];
   return '<span class="badge '+color+'"><i></i>'+text+'</span>';
 }
-function quotaPanel() {
-  const q = state.quota, rows = state.data.upstreams;
-  return `<div class="panel quota-panel"><div class="panel-title"><h2>上游额度</h2><button class="icon-button" data-action="quota" aria-label="刷新全部额度" title="刷新额度" ${!rows.length ? 'disabled' : ''}>${icon('refresh')}</button></div><div class="quota-balance"><span>Anlas 合计</span><strong>${q ? number(q.totalAnlas) : '—'}<small>Anlas</small></strong></div><div class="pool-quota-list">${rows.map(row => { const account = quotaFor(row.id), pct = remaining(account); return `<div class="pool-quota-item"><div class="pool-quota-heading"><strong>${e(row.name)}</strong><span>${account?.ok ? number(account.account.relay.balance) + ' Anlas' : '—'}</span></div><div class="quota-row"><span>NAI5 剩余额度</span><b>${pct === null ? '—' : pct.toFixed(1) + '%'}</b></div><div class="progress-track"><div style="width:${pct ?? 0}%"></div></div>${account && !account.ok ? '<p class="field-note">查询失败</p>' : ''}</div>`; }).join('') || '<p class="muted">暂无上游</p>'}</div>${state.quotaError || q ? '<p class="field-note">'+e(state.quotaError || (q.failed ? q.failed + ' 个账户查询失败，未计入合计' : date(q.fetchedAt) + ' 更新'))+'</p>' : ''}</div>`;
-}
 function upstreamCards() {
   const rows = state.data.upstreams;
   return rows.length ? rows.map(row => {
@@ -158,15 +154,42 @@ function usageComparison(days) {
     return `<div class="comparison-column ${s.style}" title="${day.label} ${s.label}：${number(value)} Anlas"><span class="comparison-value">${number(value)}</span><div class="comparison-bar ${value ? '' : 'zero'}" style="height:${value ? Math.max(4, value / max * 128) : 2}px"></div></div>`;
   }).join('')}</div><span class="chart-date">${day.label}</span></div>`).join('')}</div><div class="chart-caption comparison-totals"><span>7 天合计</span>${series.map(s => `<span class="${s.style}">${s.label}<b>${number(days.reduce((sum, day) => sum + (day[s.metric] ?? 0), 0))} <small>Anlas</small></b></span>`).join('')}</div></section>`;
 }
+function quotaTotals(data, quota, now = Date.now()) {
+  const keys = data.keys.filter(key => key.enabled && (key.expires_at === null || key.expires_at > now));
+  const totals = {
+    stamina: { available: 0, issued: keys.reduce((sum, key) => sum + (key.tier === 'member' ? Math.max(0, key.stamina_balance - key.stamina_reserved) : 0), 0) / 1120 },
+    anlas: { available: 0, issued: keys.reduce((sum, key) => sum + Math.max(0, key.balance - key.reserved), 0) },
+  };
+  for (const row of data.upstreams.filter(row => row.enabled)) {
+    const result = quota?.upstreams.find(item => item.id === row.id);
+    if (!result?.ok) { totals.stamina.available = null; totals.anlas.available = null; continue; }
+    const account = result.account;
+    if (totals.anlas.available !== null) totals.anlas.available += account.relay.available;
+    const active = [1, 2, 3, 4].includes(account.accountType ?? 0) || (account.expiresAt !== undefined ? account.expiresAt > now / 1000 : account.active);
+    if (account.tier !== 3 || !active) continue;
+    const usage = account.usage;
+    if (!Number.isFinite(usage?.percent) || typeof usage.isNegative !== 'boolean') { totals.stamina.available = null; continue; }
+    if (totals.stamina.available !== null) totals.stamina.available += usage.isNegative ? 0 : Math.max(0, Math.min(100, usage.percent));
+  }
+  return totals;
+}
+function quotaComparison() {
+  const totals = quotaTotals(state.data, state.quota);
+  return `<div class="quota-comparison-grid">${[['stamina', 'V5 体力'], ['anlas', 'Anlas']].map(([metric, title]) => {
+    const { available, issued } = totals[metric], difference = available === null ? null : available - issued;
+    const format = value => value === null ? '—' : metric === 'stamina' ? value.toFixed(1) + '%' : number(value);
+    return `<section class="panel quota-comparison"><div class="panel-title"><h2>${title}</h2><span class="quota-difference ${difference < 0 ? 'deficit' : ''}">差额 <b>${format(difference)}</b></span></div><div class="quota-comparison-values">${[['可用', available, 'available'], ['已发', issued, 'issued']].map(([label, value, kind]) => `<div class="quota-comparison-row ${kind}"><span>${label}</span><strong>${format(value)}</strong></div>`).join('')}</div></section>`;
+  }).join('')}</div>`;
+}
 function overview() {
-  const d = state.data, available = d.keys.reduce((sum, key) => sum + key.balance - key.reserved, 0);
-  const cards = [['访问密钥', number(d.keys.length), `${d.keys.filter(k => k.enabled && !expired(k)).length} 个启用中`, 'key'], ['密钥可用 Anlas', number(available), '', 'coins'], ['累计消耗', number(d.stats.spent), '', 'activity'], ['请求总数', number(d.stats.requests), '', 'clock']];
+  const d = state.data;
+  const cards = [['访问密钥', number(d.keys.length), `${d.keys.filter(k => k.enabled && !expired(k)).length} 个启用中`, 'key'], ['上游密钥', number(d.upstreams.length), '', 'shield'], ['累计消耗', number(d.stats.spent), '', 'activity'], ['请求总数', number(d.stats.requests), '', 'clock']];
   const now = Date.now();
   const days = Array.from({ length: 7 }, (_, i) => {
     const day = new Date(now - (6 - i) * 86400000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     return { ...d.trend.find(item => item.day === day), label: Number(day.slice(5, 7)) + '/' + Number(day.slice(8, 10)) };
   });
-  return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,hint,symbol], i) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}${i === 1 || i === 2 ? '<small>Anlas</small>' : ''}</strong>${hint ? `<p>${hint}</p>` : ""}</article>`).join('')}</div><div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div><div class="overview-grid"><section class="panel recent-panel"><div class="panel-title"><div><h2>最近创建的密钥</h2></div><a class="text-link" href="#keys">查看全部 ${icon('arrow')}</a></div>${keyTable(d.keys.slice(0, 4))}</section>${quotaPanel()}</div>`;
+  return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,hint,symbol], i) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}${i === 2 ? '<small>Anlas</small>' : ''}</strong>${hint ? `<p>${hint}</p>` : ""}</article>`).join('')}</div>${quotaComparison()}<div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div>`;
 }
 function keyTable(keys) {
   if (state.view === 'keys' && state.filter.trim()) {
@@ -256,7 +279,7 @@ function stopEvents() { clearTimeout(liveRetryTimer); liveRetryTimer = null; liv
 function updateQuota(data) {
   if (state.quota && state.quota.fetchedAt > data.fetchedAt) return;
   state.quota = data; state.quotaError = '';
-  const panel = $('.quota-panel'); if (panel) panel.outerHTML = quotaPanel();
+  const comparison = $('.quota-comparison-grid'); if (comparison) comparison.outerHTML = quotaComparison();
   const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
 }
 function applySnapshot(data) {
@@ -320,7 +343,6 @@ async function quota() {
   state.quotaError = '';
   try { updateQuota(await api('/quota')); } catch (error) { state.quotaError = error.message; }
   // Preserve unsaved settings inputs when refreshing quota.
-  const panel = $('.quota-panel'); if (panel) panel.outerHTML = quotaPanel();
   const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
 }
 function createKey() {
