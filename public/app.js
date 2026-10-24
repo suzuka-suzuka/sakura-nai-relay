@@ -22,6 +22,7 @@ const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
 const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobKey: '', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
 let jobSearchVersion = 0;
+const jobParameterSources = new WeakMap();
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
 let liveEvents = null, liveRetryTimer = null, settingsDirty = false, snapshotVersion = 0;
 const titles = { overview: '运行概览', keys: '访问密钥', cdks: '兑换码', usage: '用量记录', settings: '上游设置' };
@@ -74,11 +75,12 @@ async function copy(text, source) {
   throw new Error('浏览器未允许自动复制，已选中文本，请按 Ctrl+C / ⌘C 或长按复制');
 }
 function modal(title, content, subtitle = '') {
+  closeJobParameters();
   const dialog = $('#dialog');
   dialog.innerHTML = `<div class="modal-head"><div><h2 id="dialog-title">${e(title)}</h2>${subtitle ? `<p class="muted">${e(subtitle)}</p>` : ''}</div><button class="icon-button" data-action="close" aria-label="关闭">${icon('close')}</button></div>${content}`;
   if (!dialog.open) dialog.showModal();
 }
-function closeModal() { $('#dialog').close(); $('#dialog').innerHTML = ''; }
+function closeModal() { closeJobParameters(); $('#dialog').close(); $('#dialog').innerHTML = ''; }
 function badge(status) {
   const names = { completed: ['成功', 'green'], failed: ['失败', 'muted'], rejected: ['失败', 'muted'], running: ['处理中', 'pink'], resolved: ['已结算', 'green'] };
   const [name, color] = names[status] ?? ['未知', 'muted']; return `<span class="badge ${color}"><i></i>${name}</span>`;
@@ -406,12 +408,26 @@ function removeKey(id) {
 function jobDiagnosticsView(d) {
   if (!d) return '<p class="field-note">此记录未保存诊断信息；更新后提交的请求会自动记录。</p>';
   const section = (title, text) => `<section class="diagnostic-section"><h3>${e(title)}</h3><pre class="diagnostic-text">${e(text)}</pre></section>`;
-  let request = d.request_json;
-  try { if (request) request = JSON.stringify(JSON.parse(request), null, 2); } catch { /* Display older text as saved. */ }
   return (d.response_content_type ? '<p class="field-note">上游响应类型：'+e(d.response_content_type)+'</p>' : '') +
     (d.upstream_error !== null ? section('NovelAI 错误原文（已脱敏）', d.upstream_error || '[上游返回空响应]') : '') +
     (d.failure_detail ? section('中断 / 解析原因', d.failure_detail) : '') +
-    (request ? section('请求参数（图片与密钥已脱敏）', request) : '');
+    (d.request_json ? '<button class="button small subtle" data-action="job-parameters">请求参数</button>' : '');
+}
+function jobParametersView(request) {
+  try { request = JSON.stringify(JSON.parse(request), null, 2); } catch { /* Display older text as saved. */ }
+  return '<pre class="diagnostic-text">'+e(request)+'</pre>';
+}
+function openJobParameters(button) {
+  const request = jobParameterSources.get(button); if (!request) return;
+  const dialog = $('#job-parameters-dialog');
+  dialog.innerHTML = '<div class="modal-head"><h2 id="job-parameters-title">请求参数</h2><button class="icon-button" data-action="close-job-parameters" aria-label="关闭">'+icon('close')+'</button></div>'+
+    jobParametersView(request)+'<div class="modal-actions"><button class="button subtle" data-action="close-job-parameters">返回详情</button></div>';
+  dialog.showModal();
+}
+function closeJobParameters() {
+  const dialog = $('#job-parameters-dialog');
+  if (dialog?.open) dialog.close();
+  if (dialog) dialog.innerHTML = '';
 }
 async function jobDetail(id) {
   const j = visibleJobs().find(j => j.id === id); if (!j) return;
@@ -429,7 +445,11 @@ async function jobDetail(id) {
   const container = $('#job-diagnostics');
   try {
     const result = await api('/jobs/' + encodeURIComponent(id));
-    if (container?.isConnected) container.innerHTML = jobDiagnosticsView(result.diagnostics);
+    if (container?.isConnected) {
+      container.innerHTML = jobDiagnosticsView(result.diagnostics);
+      const button = $('[data-action="job-parameters"]', container);
+      if (button) jobParameterSources.set(button, result.diagnostics.request_json);
+    }
   } catch (error) {
     if (container?.isConnected) container.innerHTML = '<p class="field-note">诊断信息读取失败：'+e(error.message)+'</p>';
   }
@@ -445,6 +465,8 @@ document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]'); if (!button) return;
   const { action, id } = button.dataset;
   if (action === 'close') return closeModal();
+  if (action === 'job-parameters') return openJobParameters(button);
+  if (action === 'close-job-parameters') return closeJobParameters();
   if (action === 'create') return createKey();
   if (action === 'edit-key') return keyForm(id);
   if (action === 'remove-key') return removeKey(id);
@@ -558,6 +580,7 @@ document.addEventListener('submit', async event => {
 });
 $('#dialog').addEventListener('click', event => { if (event.target === $('#dialog')) { const r = event.target.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) closeModal(); } });
 $('#dialog').addEventListener('close', () => { $('#dialog').innerHTML = ''; });
+$('#job-parameters-dialog').addEventListener('close', () => { $('#job-parameters-dialog').innerHTML = ''; });
 window.addEventListener('hashchange', () => { const view = location.hash.slice(1); state.view = titles[view] ? view : 'overview'; settingsDirty = false; if (state.data) shell(); });
 window.addEventListener('pagehide', stopEvents);
 window.addEventListener('pageshow', () => { if (state.data) startEvents(); });

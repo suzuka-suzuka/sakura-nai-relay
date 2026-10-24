@@ -131,13 +131,17 @@ test('新增诊断表兼容旧库且重启保留日志，不改变结算记录',
   assert.deepEqual(store.db.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
-test('详情展示原文和格式化参数，对 HTML 转义且明确提示旧记录缺失', () => {
+test('详情保留错误原文，参数在单独弹窗格式化并转义，旧记录提示缺失', () => {
   const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   const start = source.indexOf('function jobDiagnosticsView('), end = source.indexOf('async function jobDetail(', start);
   const context = createContext({});
   runInContext(`const e = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));\n` + source.slice(start, end), context);
   const html = runInContext(`jobDiagnosticsView({request_json:'{"parameters":{"seed":42}}',upstream_error:'<script>alert(1)</script>',failure_detail:'socket closed',response_content_type:'text/plain'})`, context);
   assert.match(html, /NovelAI 错误原文/); assert.match(html, /&lt;script&gt;/); assert.ok(!html.includes('<script>'));
-  assert.match(html, /&quot;seed&quot;: 42/); assert.match(html, /socket closed/);
+  assert.match(html, /data-action="job-parameters">请求参数/); assert.match(html, /socket closed/);
+  assert.ok(!html.includes('seed'));
+  const parameters = runInContext(`jobParametersView('{"parameters":{"seed":42},"input":"<script>alert(1)</script>"}')`, context);
+  assert.match(parameters, /&quot;seed&quot;: 42/); assert.match(parameters, /&lt;script&gt;/);
+  assert.ok(!parameters.includes('<script>'));
   assert.match(runInContext('jobDiagnosticsView(null)', context), /未保存诊断信息/);
 });
