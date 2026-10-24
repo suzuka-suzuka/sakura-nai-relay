@@ -56,6 +56,7 @@ export class Store {
         id INTEGER PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys(id), delta INTEGER NOT NULL,
         kind TEXT NOT NULL, note TEXT NOT NULL, job_id TEXT, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS jobs_time ON jobs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS jobs_key ON jobs(key_id);
       CREATE INDEX IF NOT EXISTS ledger_time ON ledger(created_at DESC);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS job_diagnostics (
       job_id TEXT PRIMARY KEY REFERENCES jobs(id), request_json TEXT,
@@ -344,7 +345,15 @@ export class Store {
   fail(id, note, http = null) {
     if (this.db.prepare("SELECT id FROM jobs WHERE id=? AND status='running'").get(id)) this.settle(id, 0, 'failed', note, http);
   }
-  jobs(limit = 100) { return this.db.prepare('SELECT jobs.*,keys.name AS key_name FROM jobs JOIN keys ON keys.id=jobs.key_id ORDER BY jobs.rowid DESC LIMIT ?').all(limit); }
+  jobs(limit = 100, keyId = null) {
+    const query = `SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs JOIN keys ON keys.id=jobs.key_id
+      ${keyId === null ? '' : 'WHERE jobs.key_id=?'} ORDER BY jobs.rowid DESC LIMIT ?`;
+    return this.db.prepare(query).all(...(keyId === null ? [limit] : [keyId, limit]));
+  }
+  jobKeys() {
+    return this.db.prepare(`SELECT id,name,prefix,retired_at FROM keys
+      WHERE retired_at IS NULL OR EXISTS (SELECT 1 FROM jobs WHERE jobs.key_id=keys.id) ORDER BY id DESC`).all();
+  }
   saveJobDiagnostics(id, { request = null, upstreamError = null, failure = null, contentType = null } = {}) {
     this.db.prepare(`INSERT INTO job_diagnostics(job_id,request_json,upstream_error,failure_detail,response_content_type) VALUES(?,?,?,?,?)
       ON CONFLICT(job_id) DO UPDATE SET request_json=COALESCE(excluded.request_json,request_json),

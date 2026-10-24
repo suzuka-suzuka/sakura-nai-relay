@@ -58,7 +58,7 @@ export function createApp(config) {
   function snapshot() {
     const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
     const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
-    return { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys().map(key => ({ ...key, expired: key.expires_at !== null && key.expires_at <= Date.now() })), jobs: store.jobs(), ledger: store.ledger(), stats, trend, cdks: { products: store.cdkSummary(), redemptions: store.cdkRedemptions() }, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` };
+    return { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys().map(key => ({ ...key, expired: key.expires_at !== null && key.expires_at <= Date.now() })), jobs: store.jobs(), jobKeys: store.jobKeys(), ledger: store.ledger(), stats, trend, cdks: { products: store.cdkSummary(), redemptions: store.cdkRedemptions() }, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` };
   }
   async function readQuota() {
     const rows = store.upstreams(), results = new Array(rows.length); let cursor = 0;
@@ -104,6 +104,12 @@ export function createApp(config) {
     }
     if (path === '/admin/api/snapshot' && req.method === 'GET') {
       return json(res, 200, snapshot());
+    }
+    if (path === '/admin/api/jobs' && req.method === 'GET') {
+      const value = new URL(req.url, config.publicOrigin).searchParams.get('keyId');
+      assert(value === null || /^[1-9]\d*$/.test(value), '密钥编号无效');
+      const keyId = value === null ? null : integer(Number(value), 1, Number.MAX_SAFE_INTEGER, '密钥编号');
+      return json(res, 200, { jobs: store.jobs(100, keyId) });
     }
     if (path.startsWith('/admin/api/jobs/') && req.method === 'GET') {
       const id = path.slice('/admin/api/jobs/'.length);

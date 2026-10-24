@@ -20,7 +20,8 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', cdks: null, cdkQuery: '', cdkHit: null };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobKey: '', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
+let jobSearchVersion = 0;
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
 let liveEvents = null, liveRetryTimer = null, settingsDirty = false, snapshotVersion = 0;
 const titles = { overview: '运行概览', keys: '访问密钥', cdks: '兑换码', usage: '用量记录', settings: '上游设置' };
@@ -225,9 +226,34 @@ async function searchKeys() {
     toast(error.message, true);
   }
 }
+function visibleJobs() { return state.jobKey ? state.filteredJobs ?? [] : state.data.jobs; }
+function jobTable() {
+  if (state.jobKey && state.filteredJobs === null) return empty(state.jobError || '加载中…', '');
+  const rows = visibleJobs();
+  return rows.length ? `<div class="table-scroll"><table class="request-table"><thead><tr><th>请求 / 时间</th><th>Key</th><th>上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${rows.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><span class="request-line">${date(j.created_at)}</span></td><td><span class="request-key-name">${e(j.key_name)}</span><code class="request-line">${e(j.key_prefix)}</code></td><td>${e(j.upstream_name || '旧记录')}</td><td><span class="model-name">${e(j.model)}</span><span class="request-line">${e(j.endpoint.replace('/ai/', ''))}</span></td><td>${badge(j.status)}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty('暂无请求记录', '');
+}
+async function loadFilteredJobs() {
+  const version = ++jobSearchVersion, keyId = state.jobKey;
+  if (!keyId) return;
+  try {
+    const result = await api('/jobs?keyId=' + encodeURIComponent(keyId));
+    if (version !== jobSearchVersion || keyId !== state.jobKey || !state.data) return;
+    state.filteredJobs = result.jobs; state.jobError = '';
+  } catch (error) {
+    if (version !== jobSearchVersion || keyId !== state.jobKey || !state.data) return;
+    state.filteredJobs = null; state.jobError = error.message;
+  }
+  const table = $('#request-records');
+  if (table) {
+    const scroll = $('.table-scroll', table), position = scroll ? [scroll.scrollLeft, scroll.scrollTop] : null;
+    table.innerHTML = jobTable();
+    const next = $('.table-scroll', table); if (next && position) [next.scrollLeft, next.scrollTop] = position;
+  }
+}
 function usageView() {
   const d = state.data;
-  return `<div class="panel"><div class="panel-title"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div><span class="muted">最近 100 条</span></div>${state.logs === 'jobs' ? (d.jobs.length ? `<div class="table-scroll"><table><thead><tr><th>请求 / 时间</th><th>访问密钥 / 上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${d.jobs.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><small class="cell-note">${date(j.created_at)}</small></td><td>${e(j.key_name)}<small class="cell-note">${e(j.upstream_name || "旧记录")}</small></td><td><span class="model-name">${e(j.model)}</span><small class="cell-note">${e(j.endpoint.replace('/ai/', ''))}</small></td><td>${badge(j.status)}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty('暂无请求记录', '')) : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
+  const filter = `<select id="job-key-filter" aria-label="按 Key 筛选"><option value="">全部 Key</option>${(d.jobKeys ?? d.keys).map(k => `<option value="${k.id}" ${String(k.id) === state.jobKey ? 'selected' : ''}>${e(k.name)} · ${e(k.prefix)}${k.retired_at ? ' · 已删除' : ''}</option>`).join('')}</select>`;
+  return `<div class="panel"><div class="panel-title"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div>${state.logs === 'jobs' ? filter : ''}</div>${state.logs === 'jobs' ? `<div id="request-records">${jobTable()}</div>` : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
 }
 function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
@@ -274,8 +300,9 @@ function renderView() {
   $('#view').innerHTML = ({ overview, keys: keysView, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
   if (state.view === 'cdks' && !state.cdks) void loadCdks();
+  if (state.view === 'usage' && state.logs === 'jobs' && state.jobKey) void loadFilteredJobs();
 }
-function stopEvents() { clearTimeout(liveRetryTimer); liveRetryTimer = null; liveEvents?.close(); liveEvents = null; snapshotVersion++; }
+function stopEvents() { clearTimeout(liveRetryTimer); liveRetryTimer = null; liveEvents?.close(); liveEvents = null; snapshotVersion++; jobSearchVersion++; }
 function updateQuota(data) {
   if (state.quota && state.quota.fetchedAt > data.fetchedAt) return;
   state.quota = data; state.quotaError = '';
@@ -285,6 +312,7 @@ function updateQuota(data) {
 function applySnapshot(data) {
   const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
   if (!previous) { settingsDirty = false; shell(); return; }
+  if (state.view === 'usage' && state.logs === 'jobs' && state.jobKey) void loadFilteredJobs();
   const count = $('.nav-item[href="#keys"] small'); if (count) count.textContent = data.keys.length;
   const connection = $('.connection-state');
   if (connection) {
@@ -302,8 +330,14 @@ function applySnapshot(data) {
     if (state.filter.trim() && identity(previous.keys) !== identity(data.keys)) void searchKeys();
   } else {
     const preserved = state.view === 'settings' && settingsDirty ? $('#settings-form') : state.view === 'cdks' ? $('#cdk-search-form') : null;
+    const keyFilter = state.view === 'usage' && focused?.id === 'job-key-filter' ? focused : null;
     view.innerHTML = ({ overview, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
     if (preserved) $('#'+preserved.id).replaceWith(preserved);
+    if (keyFilter) {
+      const next = $('#job-key-filter');
+      if (next && keyFilter.innerHTML === next.innerHTML) next.replaceWith(keyFilter);
+      else next?.focus({ preventScroll: true });
+    }
   }
   if (focused && view.contains(focused)) { focused.focus({ preventScroll: true }); if (selection) focused.setSelectionRange(...selection); }
   view.querySelectorAll('.table-scroll').forEach((node, index) => { if (scrolls[index]) [node.scrollLeft, node.scrollTop] = scrolls[index]; });
@@ -380,10 +414,11 @@ function jobDiagnosticsView(d) {
     (request ? section('请求参数（图片与密钥已脱敏）', request) : '');
 }
 async function jobDetail(id) {
-  const j = state.data.jobs.find(j => j.id === id); if (!j) return;
+  const j = visibleJobs().find(j => j.id === id); if (!j) return;
+  const keyAvailable = state.data.keys.some(key => key.id === j.key_id);
   const mode = ({pool:'账号池', 'opus-pool':'Opus 免费池', 'anlas-pool':'Anlas 余额池', 'nai5-local-stamina':'V5 本地体力池', 'nai5-bound':'旧会员绑定上游', 'nai5-paid-pool':'NAI5 体力耗尽 · Anlas 池', 'nai5-stamina-pool':'NAI5 体力池 · 下游扣点'})[j.route_mode];
   modal('请求详情', '<dl class="details"><dt>请求编号</dt><dd><code>'+e(j.id)+'</code></dd>'+
-    '<dt>访问密钥</dt><dd>'+e(j.key_name)+'</dd><dt>计费等级</dt><dd>'+tierName(j.tier_snapshot)+'</dd>'+
+    '<dt>访问密钥</dt><dd>'+e(j.key_name)+'<div id="job-key-secret" class="job-key-controls"><code>'+e(j.key_prefix)+'</code><button class="button small subtle" data-action="reveal-job-key" data-id="'+j.key_id+'" '+(keyAvailable ? '' : 'disabled')+'>'+(keyAvailable ? '查看密钥' : '密钥已删除')+'</button></div></dd><dt>计费等级</dt><dd>'+tierName(j.tier_snapshot)+'</dd>'+
     '<dt>所用上游</dt><dd>'+e(j.upstream_name)+'</dd><dt>路由方式</dt><dd>'+e(mode)+'</dd>'+
     '<dt>请求接口</dt><dd><code>'+e(j.endpoint)+'</code></dd><dt>上游 HTTP 状态</dt><dd>'+e(j.http_status ?? '—')+'</dd>'+
     '<dt>状态</dt><dd>'+badge(j.status)+'</dd><dt>本地报价</dt><dd>'+number(j.reserved)+' Anlas</dd>'+
@@ -399,6 +434,12 @@ async function jobDetail(id) {
     if (container?.isConnected) container.innerHTML = '<p class="field-note">诊断信息读取失败：'+e(error.message)+'</p>';
   }
 }
+async function revealJobKey(id) {
+  const container = $('#job-key-secret'); if (!container) return;
+  const { token } = await api('/keys/' + encodeURIComponent(id) + '/reveal', { method: 'POST', body: {} });
+  if (!container.isConnected) return;
+  container.innerHTML = '<code id="new-token" class="token-display">'+e(token)+'</code><button class="button small subtle" data-action="copy-key">复制密钥</button>';
+}
 
 document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]'); if (!button) return;
@@ -411,6 +452,7 @@ document.addEventListener('click', async event => {
   if (action === 'remove-upstream') return modal('移除上游', '<p class="muted">移除后不再分配请求，已有用量记录仍会保留。下游本地体力和点数不受影响。</p><div class="modal-actions"><button class="button subtle" data-action="close">取消</button><button class="button danger" data-action="confirm-remove-upstream" data-id="'+id+'">确认移除</button></div>');
   if (action === 'points') return points(id);
   if (action === 'key-detail') return withButton(button, () => detail(id));
+  if (action === 'reveal-job-key') return withButton(button, () => revealJobKey(id));
   if (action === 'job') return jobDetail(id);
   if (action === 'logs') { state.logs = button.dataset.tab; return renderView(); }
   if (action === 'mint-cdks') return mintCdks(id);
@@ -453,7 +495,16 @@ document.addEventListener('input', event => {
   $('#key-table').innerHTML = keyTable(filteredKeys());
   if (state.filter.trim()) keySearchTimer = setTimeout(searchKeys, 200);
 });
-document.addEventListener('change', event => { if (event.target.closest('#key-form')) syncKeyForm(); if (event.target.closest('#settings-form')) settingsDirty = true; });
+document.addEventListener('change', event => {
+  if (event.target.id === 'job-key-filter') {
+    state.jobKey = event.target.value; state.filteredJobs = null; state.jobError = ''; jobSearchVersion++;
+    $('#request-records').innerHTML = jobTable();
+    if (state.jobKey) void loadFilteredJobs();
+    return;
+  }
+  if (event.target.closest('#key-form')) syncKeyForm();
+  if (event.target.closest('#settings-form')) settingsDirty = true;
+});
 document.addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target, button = $('button[type="submit"]', form), values = Object.fromEntries(new FormData(form));
   const errorNode = $('.form-error', form); if (errorNode) errorNode.textContent = '';
