@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/server.mjs';
+import { mockUpstream } from './mock.mjs';
 
 const origin = 'http://127.0.0.1:3100';
 const day = 86400000;
@@ -47,6 +48,7 @@ test('兑换页可打开，提交兑换码后才创建对应规格的密钥', as
     ['trial-100', { tier: 'standard', points: 100, stamina: 0, days: 30 }],
     ['trial-opus-1d', { tier: 'member', points: 0, stamina: 4480, days: 1 }],
     ['points-2k', { tier: 'standard', points: 2000, stamina: 0, days: 30 }],
+    ['month-v45', { tier: 'member', points: 0, stamina: 0, days: 30 }],
     ['month-shared', { tier: 'member', points: 0, stamina: 28000, days: 30 }],
     ['month-shared-2k', { tier: 'member', points: 2000, stamina: 28000, days: 30 }],
     ['month-exclusive', { tier: 'member', points: 10000, stamina: 112000, days: 30 }],
@@ -68,6 +70,8 @@ test('兑换页可打开，提交兑换码后才创建对应规格的密钥', as
     assert.equal(key.tier, spec.tier);
     assert.equal(key.balance, spec.points);
     assert.equal(key.stamina_capacity, spec.stamina);
+    assert.equal(key.stamina_balance, spec.stamina);
+    assert.equal(result.body.staminaPercent, spec.stamina / 1120);
     assert.equal(key.name, result.body.name);
     assert.ok(Math.abs(key.expires_at - (Date.now() + spec.days * day)) < 5000);
     const again = await redeem(base, stock.codes[0]);
@@ -78,12 +82,49 @@ test('兑换页可打开，提交兑换码后才创建对应规格的密钥', as
   }
   const summary = await (await call('/admin/api/cdks')).json();
   assert.equal(summary.products.find(product => product.id === 'month-exclusive').staminaPercent, 100);
+  assert.equal(summary.products.findIndex(product => product.id === 'month-v45') + 1, summary.products.findIndex(product => product.id === 'month-shared'));
   assert.equal(summary.products.every(product => product.redeemed === 1 && product.unused === 0), true);
-  assert.equal(summary.redemptions.length, 6);
+  assert.equal(summary.redemptions.length, 7);
   assert.doesNotMatch(JSON.stringify(summary), /CDK-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}/);
   const ledger = app.store.ledger();
   assert.equal(ledger.find(row => row.delta === 10000).note, '兑换码创建');
   assert.equal(ledger.some(row => row.delta === 0), false);
+});
+
+test('V4.5 月卡可重复免费生成小图，零 V5 体力不恢复，编辑续期保留权益', async t => {
+  const mock = await mockUpstream();
+  t.after(() => mock.close());
+  const { app, base, call } = await fixture(t, { upstreamOrigin: mock.origin });
+  app.store.setUpstream('pst-fixture');
+  const { codes } = await mint(call, 'month-v45');
+  const result = await redeem(base, codes[0]);
+  assert.equal(result.status, 200);
+  const key = app.store.authenticate(result.body.token);
+  const relay = body => fetch(base + '/ai/generate-image', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + result.body.token }, body: JSON.stringify(body),
+  });
+  const request = model => ({ model, action: 'generate', input: 'test', parameters: { width: 832, height: 1216, steps: 23, n_samples: 1 } });
+  for (const model of ['nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated']) {
+    for (let i = 0; i < 2; i++) {
+      const response = await relay(request(model));
+      assert.equal(response.status, 200);
+      await response.arrayBuffer();
+    }
+  }
+  assert.equal(app.store.jobs().length, 4);
+  assert.ok(app.store.jobs().every(job => job.status === 'completed' && job.charged === 0 && job.stamina_charged === 0));
+  const generated = mock.state.calls.filter(call => call.path === '/ai/generate-image').length;
+  assert.equal((await relay(request('nai-diffusion-5-full'))).status, 402);
+  const large = request('nai-diffusion-4-5-full');
+  large.parameters.width = 1024; large.parameters.height = 1536;
+  assert.equal((await relay(large)).status, 402);
+  assert.equal(mock.state.calls.filter(call => call.path === '/ai/generate-image').length, generated);
+  assert.equal((await call('/admin/api/keys/' + key.id, 'POST', { name: 'V4.5 续期', validDays: 30, tier: 'member', staminaPercent: 0 })).status, 200);
+  const renewed = app.store.refillStamina(app.store.key(key.id), key.created_at + 2 * day);
+  assert.equal(renewed.balance, 0);
+  assert.equal(renewed.stamina_capacity, 0);
+  assert.equal(renewed.stamina_balance, 0);
+  assert.ok(Math.abs(renewed.expires_at - (key.expires_at + 30 * day)) < 5000);
 });
 
 test('未使用的兑换码可以导出，无效码和已删除密钥会拒绝', async t => {

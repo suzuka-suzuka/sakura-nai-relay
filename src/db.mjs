@@ -189,7 +189,7 @@ export class Store {
     assert(['standard', 'member'].includes(tier), '等级只能是普通或会员');
     assert(options.staminaPercent === undefined || tier === 'member', '普通密钥不能分配体力');
     const percent = options.staminaPercent === undefined ? (previous.tier === 'member' ? previous.stamina_capacity / 1120 : 25) : options.staminaPercent;
-    const capacity = tier === 'member' ? capacityFor(integer(percent, 1, 100, '体力上限')) : 0;
+    const capacity = tier === 'member' ? capacityFor(integer(percent, 0, 100, '体力上限')) : 0;
     assert(!(options.validDays !== undefined && options.expiresAt !== undefined), '有效天数和到期时间不能同时设置');
     let expires = options.expiresAt === undefined ? previous.expires_at ?? null : options.expiresAt;
     if (options.validDays !== undefined) expires = Math.max(Date.now(), previous.expires_at ?? 0) + integer(options.validDays, 1, 36500, '有效天数') * 86400000;

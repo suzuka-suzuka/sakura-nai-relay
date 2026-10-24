@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import { assert } from './security.mjs';
 
-// 体力是 1–100 的百分比。4% 约 44 张免费小图，25% 是 280 张，100% 是 1120 张。
+// 体力是 0–100 的百分比。0% 不分配 V5 体力，4% 约 44 张免费小图，25% 是 280 张，100% 是 1120 张。
 export const PRODUCTS = [
   { id: 'trial-100', name: '体验：100点数', tier: 'standard', points: 100, validDays: 30 },
   { id: 'trial-opus-1d', name: '体验：1天Opus', tier: 'member', points: 0, staminaPercent: 4, validDays: 1 },
   { id: 'points-2k', name: '按量：2k点数包', tier: 'standard', points: 2000, validDays: 30 },
+  { id: 'month-v45', name: '月卡：V4.5无限小图(无V5体力)', tier: 'member', points: 0, staminaPercent: 0, validDays: 30 },
   { id: 'month-shared', name: '月卡：4人Opus无限小图(无点)', tier: 'member', points: 0, staminaPercent: 25, validDays: 30 },
   { id: 'month-shared-2k', name: '月卡：4人Opus无限小图+2k点', tier: 'member', points: 2000, staminaPercent: 25, validDays: 30 },
   { id: 'month-exclusive', name: '月卡：单人独享Opus(含1w点)', tier: 'member', points: 10000, staminaPercent: 100, validDays: 30 },

@@ -26,9 +26,12 @@ async function copy(text, source) {
 
 function showResult(data) {
   const box = $('#redeem-result');
-  const stamina = data.tier === 'member' ? `体力上限 ${data.staminaPercent}%` : '无体力，按点数计费';
+  const stamina = data.tier === 'member' ? data.staminaPercent === 0 ? '无 V5 体力' : `体力上限 ${data.staminaPercent}%` : '无体力，按点数计费';
+  const billingNote = data.tier === 'member' && data.staminaPercent === 0
+    ? 'V4.5 免费规格小图不限次数，其余按点数计费。'
+    : '会员非 V5 免费小图不扣点；V5 优先扣体力，其余按点数计费。';
   box.hidden = false;
-  box.innerHTML = `<h2>密钥已生成</h2><p class="muted">请马上复制。这枚兑换码不能再次查看密钥，关掉页面前先保存。</p><div class="secret-row"><span>商品</span><strong>${escapeHTML(data.name)}</strong><small>${escapeHTML(tierName(data.tier))} · ${escapeHTML(stamina)} · ${data.points} Anlas · ${escapeHTML(expiresText(data.expiresAt))}</small></div><div class="secret-row"><span>中转地址</span><code id="relay-url">${escapeHTML(data.relayUrl)}</code><button class="button small subtle" type="button" data-copy="relay-url">复制地址</button></div><div class="secret-row"><span>访问密钥</span><code id="relay-key" class="token-display">${escapeHTML(data.token)}</code><button class="button small primary" type="button" data-copy="relay-key">复制密钥</button></div><ol class="redeem-steps"><li>在 Sakura NAI、Launcher 或其他绘图端填写上面的中转地址。</li><li>密钥填写完整的 skr_ 字符串。</li><li>会员小图走体力，其余按点数扣除。</li></ol>`;
+  box.innerHTML = `<h2>密钥已生成</h2><p class="muted">请马上复制。这枚兑换码不能再次查看密钥，关掉页面前先保存。</p><div class="secret-row"><span>商品</span><strong>${escapeHTML(data.name)}</strong><small>${escapeHTML(tierName(data.tier))} · ${escapeHTML(stamina)} · ${data.points} Anlas · ${escapeHTML(expiresText(data.expiresAt))}</small></div><div class="secret-row"><span>中转地址</span><code id="relay-url">${escapeHTML(data.relayUrl)}</code><button class="button small subtle" type="button" data-copy="relay-url">复制地址</button></div><div class="secret-row"><span>访问密钥</span><code id="relay-key" class="token-display">${escapeHTML(data.token)}</code><button class="button small primary" type="button" data-copy="relay-key">复制密钥</button></div><ol class="redeem-steps"><li>在 Sakura NAI、Launcher 或其他绘图端填写上面的中转地址。</li><li>密钥填写完整的 skr_ 字符串。</li><li>${escapeHTML(billingNote)}</li></ol>`;
 }
 
 document.addEventListener('click', async event => {

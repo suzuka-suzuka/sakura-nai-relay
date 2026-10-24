@@ -928,10 +928,10 @@ async function waitFor(check) {
 
 test('会员无需绑定或上游即可创建，体力上限校验且普通 Key 不分配体力',async t=>{
  const f=await fixture(t);assert.equal((await f.call('/admin/api/upstreams/1','DELETE')).status,200);f.mock.state.calls=[];
- for(const staminaPercent of [1,25,37,100]){const res=await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent});assert.equal(res.status,201);
+ for(const staminaPercent of [0,1,25,37,100]){const res=await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent});assert.equal(res.status,201);
  const created=await res.json(),key=f.app.store.key(created.id);assert.equal(key.stamina_balance,staminaPercent*1120);assert.equal(key.stamina_capacity,staminaPercent*1120);assert.equal(key.nai5_upstream_id,undefined);
- const subscription=await(await f.relay('/user/subscription',undefined,{Authorization:'Bearer '+created.token})).json();assert.deepEqual(subscription.usage,{percent:staminaPercent,isNegative:false});}
- for(const staminaPercent of [0,101,25.5,'25',null])assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent})).status,400);
+ const subscription=await(await f.relay('/user/subscription',undefined,{Authorization:'Bearer '+created.token})).json();assert.deepEqual(subscription.usage,{percent:staminaPercent,isNegative:staminaPercent === 0});}
+ for(const staminaPercent of [-1,101,25.5,'25',null])assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'member',staminaPercent})).status,400);
  assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'standard',staminaPercent:25})).status,400);
  assert.equal((await f.call('/admin/api/keys','POST',{points:0,tier:'unknown'})).status,400);assert.equal(f.mock.state.calls.length,0);
  await member(f);assert.equal((await f.relay('/user/subscription')).status,200);

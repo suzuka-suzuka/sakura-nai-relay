@@ -106,7 +106,7 @@ function keyForm(id) {
   modal(k ? '编辑访问密钥' : '创建访问密钥', `<form id="key-form" data-id="${k?.id ?? ''}">
     <label>名称<input name="name" value="${e(k?.name ?? '')}" maxlength="64" autofocus></label>
     <label>密钥等级<select name="tier" aria-label="密钥等级"><option value="standard" ${k?.tier === 'standard' ? 'selected' : ''}>普通 · 按点数使用</option><option value="member" ${!k || k.tier === 'member' ? 'selected' : ''}>会员 · Opus 计费权益</option></select></label>
-    <div data-member-fields><label>体力上限（%）<input name="staminaPercent" type="number" min="1" max="100" step="1" value="${k?.tier === 'member' ? k.stamina_capacity / 1120 : 25}"></label></div>
+    <div data-member-fields><label>体力上限（%）<input name="staminaPercent" type="number" min="0" max="100" step="1" value="${k?.tier === 'member' ? k.stamina_capacity / 1120 : 25}"></label></div>
     ${k ? '' : '<label>初始点数（Anlas）<input name="points" type="number" min="0" max="1000000000" step="1" value="0" required></label>'}
     <label>有效期<select name="expiryMode" aria-label="有效期">${k ? '<option value="keep" selected>保持当前有效期</option>' : ''}<option value="never">永久有效</option><option value="days" ${k ? '' : 'selected'}>${k ? '按天数续期' : '按天数设置'}</option><option value="date">指定到期时间</option></select></label>
     ${k ? `<p class="field-note">当前：${e(expiresText(k.expires_at))}</p>` : ''}
@@ -233,7 +233,7 @@ function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
   return `<section class="pool-section"><div class="pool-heading"><h2>上游账户 <span class="count">${rows.length}</span></h2><button class="button primary" data-action="add-upstream">${icon('plus')}添加上游</button></div><div id="upstream-cards" class="upstream-cards">${upstreamCards()}</div></section><form class="panel settings-form" id="settings-form"><div class="panel-title"><h2>访问设置</h2><button class="button small subtle" type="button" data-action="password">修改密码</button></div><div class="access-fields"><div><label>允许的来源<textarea name="origins" rows="3" placeholder="* 或 https://example.com">${e(s.origins.join('\n'))}</textarea></label><p class="field-note">填写 * 允许所有来源；指定站点时每行一个，包含协议和端口，不含路径。访问仍需中转 Key。</p></div><div><label id="relay-address-label">中转地址</label><div class="address-field" aria-labelledby="relay-address-label"><code>${e(state.data.relayUrl)}</code><button class="icon-button" type="button" data-action="copy-url" aria-label="复制中转地址">${icon('copy')}</button></div><div class="toggle-row"><strong>开放中转</strong><label class="switch"><input name="enabled" type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="开放中转"><span></span></label></div></div></div><div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>`;
 }
-const cdkSpec = product => `${product.tier === 'member' ? '会员' : '普通'} · ${product.validDays} 天 · ${number(product.points)} 点${product.tier === 'member' ? ` · 体力 ${product.staminaPercent}%` : ''}`;
+const cdkSpec = product => `${product.tier === 'member' ? '会员' : '普通'} · ${product.validDays} 天 · ${number(product.points)} 点${product.tier === 'member' ? product.staminaPercent === 0 ? ' · 无 V5 体力' : ` · 体力 ${product.staminaPercent}%` : ''}`;
 function cdksView() {
   if (!state.cdks) return '<div class="panel"><div class="empty"><h3>正在读取库存</h3></div></div>';
   if (state.cdks.error) return `<div class="panel"><div class="empty"><h3>兑换码加载失败</h3><p>${e(state.cdks.error)}</p></div></div>`;
