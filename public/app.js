@@ -178,7 +178,7 @@ function quotaComparison() {
   return `<div class="quota-comparison-grid">${[['stamina', 'V5 体力'], ['anlas', 'Anlas']].map(([metric, title]) => {
     const { available, issued } = totals[metric], difference = available === null ? null : available - issued;
     const format = value => value === null ? '—' : metric === 'stamina' ? value.toFixed(1) + '%' : number(value);
-    return `<section class="panel quota-comparison"><div class="panel-title"><h2>${title}</h2><span class="quota-difference ${difference < 0 ? 'deficit' : ''}">差额 <b>${format(difference)}</b></span></div><div class="quota-comparison-values">${[['可用', available, 'available'], ['已发', issued, 'issued']].map(([label, value, kind]) => `<div class="quota-comparison-row ${kind}"><span>${label}</span><strong>${format(value)}</strong></div>`).join('')}</div></section>`;
+    return `<section class="panel quota-comparison"><div class="panel-title"><h2>${title}</h2><span class="quota-difference ${difference < 0 ? 'deficit' : ''}">差额 <b>${format(difference)}</b></span></div><div class="quota-comparison-values">${[['上游剩余', available, 'available'], ['下游剩余', issued, 'issued']].map(([label, value, kind]) => `<div class="quota-comparison-row ${kind}"><span>${label}</span><strong>${format(value)}</strong></div>`).join('')}</div></section>`;
   }).join('')}</div>`;
 }
 function overview() {
