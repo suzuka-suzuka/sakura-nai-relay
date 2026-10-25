@@ -21,7 +21,7 @@ const KEY_COLUMNS = `
 
 function jobStatuses(status) {
   assert(['all', 'completed', 'failed', 'cancelled'].includes(status), '请求状态筛选无效');
-  return status === 'all' ? null : JSON.stringify(status === 'failed' ? ['failed', 'rejected'] : [status]);
+  return status === 'all' ? null : JSON.stringify(status === 'failed' ? ['failed', 'rejected', 'cancelled'] : [status]);
 }
 
 export class Store {

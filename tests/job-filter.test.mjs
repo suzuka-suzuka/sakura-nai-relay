@@ -68,12 +68,12 @@ test('管理员按 Key 查询完整历史中的最近 100 条，保留已删除 
   const ids = response => response.json().then(data => data.jobs.map(job => job.id));
   assert.deepEqual((await (await get('/jobs?status=completed')).json()).jobs, snapshot.jobs);
   assert.deepEqual((await (await search(a.token, {}, 'completed')).json()).jobs, jobs);
-  assert.deepEqual(await ids(await get('/jobs?status=failed')), ['anonymous-failure', 'old-failure']);
+  assert.deepEqual(await ids(await get('/jobs?status=failed')), ['old-cancelled', 'anonymous-failure', 'old-failure']);
   assert.deepEqual(await ids(await get('/jobs?status=cancelled')), ['old-cancelled']);
   assert.deepEqual(await ids(await get(`/jobs?status=failed&keyId=${a.id}`)), ['old-failure']);
-  assert.deepEqual(await ids(await search('', {}, 'failed')), ['anonymous-failure', 'old-failure']);
+  assert.deepEqual(await ids(await search('', {}, 'failed')), ['old-cancelled', 'anonymous-failure', 'old-failure']);
   assert.deepEqual(await ids(await search(a.token, {}, 'failed')), ['old-failure']);
-  assert.deepEqual(await ids(await search(b.token, {}, 'failed')), []);
+  assert.deepEqual(await ids(await search(b.token, {}, 'failed')), ['old-cancelled']);
   assert.deepEqual(await ids(await search(b.token, {}, 'cancelled')), ['old-cancelled']);
   for (const status of ['', 'unknown', "failed' OR 1=1", null, 1, ['failed']]) {
     assert.equal((await search('', {}, status)).status, 400);
@@ -83,6 +83,12 @@ test('管理员按 Key 查询完整历史中的最近 100 条，保留已删除 
   // Legacy rejected rows belong to the failure filter too.
   store.db.prepare("UPDATE jobs SET status='rejected' WHERE id='old-failure'").run();
   assert.deepEqual(await ids(await search(a.token, {}, 'failed')), ['old-failure']);
+  store.reserve(b.id, 'running-request', '/ai/generate-image', 'nai-diffusion-4', 0, null, upstream);
+  store.beginRequest('pending-request', '/ai/generate-image', 'POST', b.token);
+  const all = await (await search(b.token, {}, 'all')).json();
+  assert.equal(all.jobs[0].id, 'running-request'); assert.equal(all.jobs[0].status, 'running');
+  assert.ok(!all.jobs.some(job => job.status === 'pending'));
+  assert.deepEqual(await ids(await search(b.token, {}, 'failed')), ['old-cancelled']);
 
 });
 
@@ -100,7 +106,7 @@ test('匿名失败与取消记录显示原因、阶段及本地状态，详情�
   context.rows = [{ ...job('cancelled-request'), key_id: null, key_name: null, key_prefix: null, model: null,
     upstream_name: '', status: 'cancelled', stage: '密钥排队', response_status: 499, http_status: null,
     request_method: 'POST', charged: 0, note: '客户端断开 <script>secret</script>' }];
-  runInContext("state.filteredJobs = rows; state.jobStatus = 'cancelled';", context);
+  runInContext("state.filteredJobs = rows; state.jobStatus = 'failed';", context);
   const html = context.jobTable();
   assert.match(html, /已取消/); assert.match(html, /未识别密钥/); assert.match(html, /未选择上游/);
   assert.match(html, /客户端断开 &lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
@@ -146,7 +152,7 @@ test('请求详情按需读取完整 Key，关闭或切换详情后丢弃迟到�
   assert.equal(container.innerHTML, '');
 });
 
-test('快速切换 Key 时忽略迟到响应和错误，清除 Key 后仍只查询成功记录', async () => {
+test('快速切换 Key 时忽略迟到响应和错误，清除 Key 后恢复全部状态记录', async () => {
   const context = ui(), pending = [];
   context.request = (path, options) => new Promise((resolve, reject) => pending.push({ path, options, resolve, reject }));
   runInContext("api = request; state.jobQuery = '1';", context);
@@ -162,7 +168,7 @@ test('快速切换 Key 时忽略迟到响应和错误，清除 Key 后仍只查�
   pending[3].resolve({ jobs: [job('success-without-key')] }); await fourth;
   pending[2].resolve({ jobs: [job('stale')] }); await third;
   assert.equal(context.visibleJobs()[0].id, 'success-without-key');
-  assert.equal(pending[3].options.body.query, ''); assert.equal(pending[3].options.body.status, 'completed');
+  assert.equal(pending[3].options.body.query, ''); assert.equal(pending[3].options.body.status, 'all');
   assert.equal(pending[0].path, '/jobs/search');
   assert.equal(pending[0].options.method, 'POST');
   assert.equal(pending[0].options.body.query, '1');
@@ -171,33 +177,34 @@ test('快速切换 Key 时忽略迟到响应和错误，清除 Key 后仍只查�
 test('状态筛选可单独使用或组合 Key，切换后忽略旧响应，实时更新保留筛选', async () => {
   const context = ui(), pending = [];
   const initial = context.usageView();
-  assert.match(initial, /data-status="completed" class="selected" aria-pressed="true">成功/);
-  assert.doesNotMatch(initial, /data-status="all"/);
+  assert.match(initial, /data-status="all" class="selected" aria-pressed="true">全部/);
+  assert.doesNotMatch(initial, /data-status="completed"|data-status="cancelled"/);
   context.request = (path, options) => new Promise((resolve, reject) => pending.push({ path, options, resolve, reject }));
   runInContext("api = request; state.jobStatus = 'failed';", context);
   assert.match(context.usageView(), /data-status="failed" class="selected" aria-pressed="true"/);
   const first = context.loadFilteredJobs();
   assert.equal(pending[0].options.body.query, ''); assert.equal(pending[0].options.body.status, 'failed');
-  runInContext("state.jobStatus = 'cancelled'; state.jobQuery = '用户';", context);
+  runInContext("state.jobStatus = 'failed'; state.jobQuery = '用户';", context);
   const second = context.loadFilteredJobs();
   pending[1].resolve({ jobs: [{ ...job('cancelled'), status: 'cancelled' }] }); await second;
   pending[0].resolve({ jobs: [job('stale-failure')] }); await first;
   assert.equal(context.visibleJobs()[0].id, 'cancelled');
-  assert.equal(pending[1].options.body.query, '用户'); assert.equal(pending[1].options.body.status, 'cancelled');
+  assert.equal(pending[1].options.body.query, '用户'); assert.equal(pending[1].options.body.status, 'failed');
   context.updateJobSearch('');
   const third = context.loadFilteredJobs();
-  assert.equal(pending[2].options.body.status, 'cancelled'); assert.equal(pending[2].options.body.query, '');
+  assert.equal(pending[2].options.body.status, 'failed'); assert.equal(pending[2].options.body.query, '');
   pending[2].resolve({ jobs: [] }); await third;
   assert.match(context.jobTable(), /没有匹配的请求记录/);
   runInContext("state.view = 'usage';", context);
   context.applySnapshot({ keys: [], jobs: [job('new-success')], cdks: {} });
-  assert.equal(pending[3].options.body.status, 'cancelled');
+  assert.equal(pending[3].options.body.status, 'failed');
   pending[3].resolve({ jobs: [{ ...job('live-cancelled'), status: 'cancelled' }] });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(context.visibleJobs()[0].id, 'live-cancelled');
-  runInContext("state.jobStatus = 'completed';", context); context.updateJobSearch('');
+  runInContext("state.jobStatus = 'all';", context); context.updateJobSearch('');
   const success = context.loadFilteredJobs();
-  assert.equal(pending[4].options.body.status, 'completed');
-  pending[4].resolve({ jobs: [job('new-success')] }); await success;
-  assert.equal(context.visibleJobs()[0].id, 'new-success');
+  assert.equal(pending[4].options.body.status, 'all');
+  pending[4].resolve({ jobs: [{ ...job('running'), status: 'running', upstream_name: '上游 1' }, job('new-success')] }); await success;
+  assert.equal(context.visibleJobs()[0].id, 'running');
+  assert.match(context.jobTable(), /处理中/);
 });
