@@ -106,15 +106,16 @@ export function createApp(config) {
       return json(res, 200, snapshot());
     }
     if (path === '/admin/api/jobs' && req.method === 'GET') {
-      const value = new URL(req.url, config.publicOrigin).searchParams.get('keyId');
+      const params = new URL(req.url, config.publicOrigin).searchParams;
+      const value = params.get('keyId');
       assert(value === null || /^[1-9]\d*$/.test(value), '密钥编号无效');
       const keyId = value === null ? null : integer(Number(value), 1, Number.MAX_SAFE_INTEGER, '密钥编号');
-      return json(res, 200, { jobs: store.jobs(100, keyId) });
+      return json(res, 200, { jobs: store.jobs(100, keyId, params.get('status') ?? 'all') });
     }
     if (path === '/admin/api/jobs/search' && req.method === 'POST') {
       const body = parse(await readBody(req, 4096));
       assert(typeof body.query === 'string' && body.query.trim().length <= 256, '搜索内容应为不超过 256 字的文本');
-      return json(res, 200, { jobs: store.searchJobs(body.query) });
+      return json(res, 200, { jobs: store.searchJobs(body.query, 100, body.status === undefined ? 'all' : body.status) });
     }
     if (path.startsWith('/admin/api/jobs/') && req.method === 'GET') {
       const id = path.slice('/admin/api/jobs/'.length);
@@ -255,7 +256,11 @@ export function createApp(config) {
     const strictStamina = stamina > 0, mode = key.tier === 'member' ? 'anlas-pool' : 'pool';
     const requireAnlas = key.tier === 'member';
     const exhaustedNai5 = key.tier === 'member' && isNai5Generation(path, body) && !hasLocalStamina(key);
-    const staminaUnavailable = () => new HttpError(503, '上游暂时无法承接本次请求，请稍后重试', 'UPSTREAM_STAMINA_UNAVAILABLE');
+    const staminaUnavailable = cause => {
+      const error = new HttpError(503, '上游暂时无法承接本次请求，请稍后重试', 'UPSTREAM_STAMINA_UNAVAILABLE');
+      error.cause = cause ?? lastError ?? new Error('没有上游同时满足本次生成的体力、订阅及余额条件');
+      return error;
+    };
     const inspect = async id => {
       const unlock = await router.lockUpstream(id, signal);
       try {
@@ -298,7 +303,7 @@ export function createApp(config) {
     };
     if (key.tier === 'member') {
       let rows;
-      try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(); throw error; }
+      try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(error); throw error; }
       const staminaPool = { scope: 'stamina', ids: new Set(), mode: 'nai5-local-stamina' };
       const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
       const anlasPool = { scope: 'anlas', ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
@@ -326,7 +331,7 @@ export function createApp(config) {
       const excluded = new Set();
       while (excluded.size < store.upstreams().length) {
         let row;
-        try { row = router.pick(excluded, pool); } catch (error) { if (strictStamina) throw staminaUnavailable(); if (lastError) throw lastError; throw error; }
+        try { row = router.pick(excluded, pool); } catch (error) { if (strictStamina) throw staminaUnavailable(lastError ?? error); if (lastError) throw lastError; throw error; }
         if (!row) break;
         excluded.add(row.id);
         let selected;
@@ -360,16 +365,19 @@ export function createApp(config) {
     throw new HttpError(503, '账号池没有余额足够的可用上游，请联系管理员补充 Anlas');
   }
 
-  async function paid(req, res, path, key) {
+  async function paid(req, res, path, key, entry) {
     const waiting = new AbortController();
     const onClose = () => waiting.abort(); res.once('close', onClose);
     let jobId = null, status = null, selected = null, unlockKey = null, msgpack = false, streamCheck = null;
-    const secrets = [req.headers.authorization?.replace(/^Bearer\s+/i, '')];
+    let body, form = null;
+    const secrets = entry.secrets;
     try {
+      store.requestStage(entry.id, '读取请求');
       const raw = await readBody(req, MAX_BODY);
+      store.requestStage(entry.id, '参数校验');
       let type = req.headers['content-type'] ?? '';
       const mediaType = type.split(';')[0].trim().toLowerCase(), streaming = path.endsWith('-stream');
-      let body, form = null, payload = raw;
+      let payload = raw;
       if (mediaType === 'multipart/form-data') {
         ({ form, body } = await parseMultipart(raw, type));
         if (path === '/ai/generate-image' || streaming) validateGenerationParts(form, body);
@@ -396,10 +404,14 @@ export function createApp(config) {
           assert(body.width === size.width && body.height === size.height, '声明尺寸与实际图片尺寸不符');
         }
       }
+      secrets.push(...diagnosticSecrets(body));
+      store.requestStage(entry.id, '参数校验', typeof body.model === 'string' ? redactDiagnosticText(body.model, secrets).slice(0, 128) : null);
       await validateInpaintingImages(body, form);
       // Drain uploads before queueing so the request-body timeout never includes queue wait.
+      store.requestStage(entry.id, '密钥排队');
       unlockKey = await router.lockKey(key.id, waiting.signal);
       // Validate the complete body before querying or occupying any upstream account.
+      store.requestStage(entry.id, '参数与额度校验');
       reservation(path, body, billingAccount(store.usableKey(key.id)));
       if (streaming) {
         msgpack = body.parameters.stream === 'msgpack';
@@ -410,12 +422,13 @@ export function createApp(config) {
       const idempotency = req.headers['idempotency-key'] ?? null;
       assert(idempotency === null || typeof idempotency === 'string' && idempotency.length <= 128 && /^[\w-]+$/.test(idempotency), 'Idempotency-Key 格式无效');
       if (idempotency) assert(!store.db.prepare('SELECT id FROM jobs WHERE key_id=? AND idempotency=?').get(key.id, idempotency), '该请求已受理，请勿重复提交', 409);
+      store.requestStage(entry.id, '选择上游 / 上游排队');
       selected = await selectUpstream(path, body, key.id, waiting.signal);
       assert(!waiting.signal.aborted, '请求已取消', 499);
       assert(options().enabled, '中转已暂停', 503);
       const { token, amount, stamina, upstreamEstimate, mode } = selected;
       secrets.push(token, ...diagnosticSecrets(body));
-      const id = random().slice(0, 18);
+      const id = entry.id;
       store.reserve(key.id,id,path,body.model ?? body.req_type ?? 'image-tool',amount,idempotency,selected.id,{ mode,upstreamEstimate,stamina });
       jobId = id;
       store.saveJobDiagnostics(id, { request: await requestDiagnostics(body, form, secrets) });
@@ -476,11 +489,19 @@ export function createApp(config) {
         else res.end();
       }
     } catch (error) {
+      // Invalid parsed parameters are useful too; never persist an unparsed body or credentials.
+      if (body) {
+        try {
+          secrets.push(...diagnosticSecrets(body));
+          store.saveJobDiagnostics(entry.id, { request: await requestDiagnostics(body, form, secrets) });
+        } catch { /* Malformed diagnostics must never replace the original validation failure. */ }
+      }
       if (jobId) store.saveJobDiagnostics(jobId, { failure: failureDiagnostics(error, streamCheck, secrets),
         upstreamError: streamCheck?.upstreamError ? redactDiagnosticText(streamCheck.upstreamError, secrets) : null });
       const transportCode = error.cause?.code ?? error.code;
       const networkCode = typeof transportCode === 'string' && /^(UND_ERR_[A-Z_]+|E[A-Z]+)$/.test(transportCode) ? transportCode : null;
-      if (jobId) store.fail(jobId, `请求超时、中断或结果不完整${networkCode ? `（${networkCode}）` : ''}，任务失败，已释放预留点数`, status);
+      if (jobId) store.fail(jobId, `${redactDiagnosticText(error.message, secrets)}${networkCode ? `（${networkCode}）` : ''}，任务失败，已释放预留点数`, status);
+      if (jobId) store.db.prepare('UPDATE jobs SET response_status=? WHERE id=?').run(error instanceof HttpError ? error.status : 502, jobId);
       if (!(error instanceof HttpError)) console.error('上游请求异常', { endpoint: path, name: error.name, code: networkCode });
       if (res.headersSent && !res.destroyed && (msgpack || String(res.getHeader('Content-Type')).includes('text/event-stream'))) {
         const event = { event_type: 'error', error: '生成失败，未扣点数', requestId: jobId };
@@ -498,6 +519,29 @@ export function createApp(config) {
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     if (config.cookieSecure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+    let entry = null, relayPath = null, relayStage = '入口校验';
+    const beginEntry = path => {
+      if (entry) return entry;
+      const token = req.headers.authorization?.match(/^Bearer (skr_[A-Za-z0-9_-]{43})$/)?.[1];
+      entry = { id: random().slice(0, 18), secrets: [req.headers.authorization?.replace(/^Bearer\s+/i, '')] };
+      store.beginRequest(entry.id, path, req.method, token);
+      if (!res.headersSent) res.setHeader('X-Request-Id', entry.id);
+      return entry;
+    };
+    const onEntryClose = () => {
+      if (!relayPath || res.writableEnded) return;
+      if (!entry) {
+        beginEntry(relayPath);
+        store.requestStage(entry.id, relayStage);
+      }
+      store.clientDisconnected(entry.id);
+      const error = new HttpError(499, PAID.has(relayPath)
+        ? '客户端断开连接，请求已取消，尚未转发上游，未扣点数'
+        : '客户端断开连接，查询已取消');
+      if (store.finishPending(entry.id, error.message, 499, true))
+        store.saveJobDiagnostics(entry.id, { failure: failureDiagnostics(error, null, entry.secrets) });
+    };
+    res.once('close', onEntryClose);
     try {
       const url = new URL(req.url, config.publicOrigin), path = url.pathname;
       if (path.startsWith('/admin/api/')) {
@@ -508,6 +552,8 @@ export function createApp(config) {
       const accountRoute = path === '/user/subscription' || path === '/ai/user/subscription' || path === '/user/data';
       const relayRoute = accountRoute || path === '/ai/generate-image/suggest-tags' || PAID.has(path);
       if (relayRoute) {
+        relayPath = path;
+        if (PAID.has(path) && req.method !== 'OPTIONS') beginEntry(path);
         const origin = req.headers.origin;
         if (origin) {
           const origins = options().origins;
@@ -522,8 +568,9 @@ export function createApp(config) {
         const token = req.headers.authorization?.match(/^Bearer (skr_[A-Za-z0-9_-]{43})$/)?.[1];
         const key = token && store.authenticate(token); assert(key, '中转密钥无效或已停用', 401);
         assert(options().enabled, '中转已暂停', 503);
-        if (PAID.has(path)) return await paid(req, res, path, key);
+        if (PAID.has(path)) return await paid(req, res, path, key, entry);
         if (accountRoute) {
+          relayStage = '额度查询';
           const current = store.usableKey(key.id);
           const subscription = downstreamSubscription(current);
           if (path === '/user/data') {
@@ -531,6 +578,7 @@ export function createApp(config) {
           }
           return json(res, 200, subscription);
         }
+        relayStage = '标签查询';
         const selected = router.pick(), upstreamToken = store.upstreamToken(selected.id);
         assert(url.search.length < 4096, '标签查询过长');
         const response = await upstream.request(`${path}${url.search}`, upstreamToken, { headers: { Accept: 'application/json' } });
@@ -552,11 +600,22 @@ export function createApp(config) {
       assert(req.method === 'GET' && assets[path], '页面不存在', 404);
       const [file, type] = assets[path]; res.writeHead(200, { 'Content-Type': type }); res.end(readFileSync(join(PUBLIC, file)));
     } catch (error) {
+      if (relayPath) {
+        const lateEntry = !entry;
+        const record = beginEntry(relayPath);
+        if (lateEntry) store.requestStage(record.id, relayStage);
+        const cancelled = error.status === 499;
+        const responseStatus = cancelled ? 499 : error instanceof HttpError ? error.status : 502;
+        const note = `${redactDiagnosticText(error.message, record.secrets)}${error.cause?.code ? `（${redactDiagnosticText(error.cause.code, record.secrets)}）` : ''}`;
+        if (store.finishPending(record.id, note, responseStatus, cancelled))
+          store.saveJobDiagnostics(record.id, { failure: failureDiagnostics(error, null, record.secrets) });
+        store.db.prepare('UPDATE jobs SET response_status=COALESCE(response_status,?) WHERE id=?').run(responseStatus, record.id);
+      }
       if (res.headersSent) { if (!res.destroyed) res.destroy(); return; }
       const status = error instanceof HttpError ? error.status : 502;
       if (status === 429) res.setHeader('Retry-After', '3');
-      json(res, status, { error: error instanceof HttpError ? error.message : '服务暂时不可用，请稍后重试或查看用量记录', ...(error.code ? { code: error.code } : {}) });
-    }
+      json(res, status, { error: error instanceof HttpError ? error.message : '服务暂时不可用，请稍后重试或查看用量记录', ...(error.code ? { code: error.code } : {}), ...(entry ? { requestId: entry.id } : {}) });
+    } finally { res.off('close', onEntryClose); }
   });
   server.requestTimeout = 30000; server.headersTimeout = 15000; server.maxHeadersCount = 50;
   return { server, store, router, isBusy: () => router.busy.size > 0, close: async () => {

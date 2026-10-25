@@ -20,7 +20,7 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', jobStatus: 'all', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
 let jobSearchVersion = 0, jobSearchTimer, jobSearchComposing = false;
 const jobParameterSources = new WeakMap();
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
@@ -82,7 +82,7 @@ function modal(title, content, subtitle = '') {
 }
 function closeModal() { closeJobParameters(); $('#dialog').close(); $('#dialog').innerHTML = ''; }
 function badge(status) {
-  const names = { completed: ['成功', 'green'], failed: ['失败', 'muted'], rejected: ['失败', 'muted'], running: ['处理中', 'pink'], resolved: ['已结算', 'green'] };
+  const names = { pending: ['等待处理', 'pink'], cancelled: ['已取消', 'muted'], completed: ['成功', 'green'], failed: ['失败', 'muted'], rejected: ['失败', 'muted'], running: ['处理中', 'pink'], resolved: ['已结算', 'green'] };
   const [name, color] = names[status] ?? ['未知', 'muted']; return `<span class="badge ${color}"><i></i>${name}</span>`;
 }
 const empty = (title, hint, action = '') => `<div class="empty"><span class="empty-icon">${icon('key')}</span><h3>${title}</h3>${hint ? `<p>${hint}</p>` : ""}${action}</div>`;
@@ -228,28 +228,29 @@ async function searchKeys() {
     toast(error.message, true);
   }
 }
-function visibleJobs() { return state.jobQuery.trim() ? state.filteredJobs ?? [] : state.data.jobs; }
+function hasJobFilter() { return !!state.jobQuery.trim() || state.jobStatus !== 'all'; }
+function visibleJobs() { return hasJobFilter() ? state.filteredJobs ?? [] : state.data.jobs; }
 function jobTable() {
-  if (state.jobQuery.trim() && state.filteredJobs === null) return empty(state.jobError || '加载中…', '');
+  if (hasJobFilter() && state.filteredJobs === null) return empty(state.jobError || '加载中…', '');
   const rows = visibleJobs();
-  return rows.length ? `<div class="table-scroll"><table class="request-table"><thead><tr><th>请求 / 时间</th><th>Key</th><th>上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${rows.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><span class="request-line">${date(j.created_at)}</span></td><td><span class="request-key-name">${e(j.key_name)}</span><code class="request-line">${e(j.key_prefix)}</code></td><td>${e(j.upstream_name || '旧记录')}</td><td><span class="model-name">${e(j.model)}</span><span class="request-line">${e(j.endpoint.replace('/ai/', ''))}</span></td><td>${badge(j.status)}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty(state.jobQuery.trim() ? '没有匹配的请求记录' : '暂无请求记录', '');
+  return rows.length ? `<div class="table-scroll"><table class="request-table"><thead><tr><th>请求 / 时间</th><th>Key</th><th>上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${rows.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><span class="request-line">${date(j.created_at)}</span></td><td><span class="request-key-name">${e(j.key_name ?? '未识别密钥')}</span><code class="request-line">${e(j.key_prefix ?? '—')}</code></td><td>${e(j.upstream_name || '未选择上游')}</td><td><span class="model-name">${e(j.model || '—')}</span><span class="request-line">${e(j.endpoint.replace('/ai/', ''))}</span></td><td>${badge(j.status)}${['failed', 'cancelled'].includes(j.status) ? `<span class="request-line request-reason">${e((j.note || '').slice(0, 80))}${j.note?.length > 80 ? '…' : ''}</span>` : ''}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty(hasJobFilter() ? '没有匹配的请求记录' : '暂无请求记录', '');
 }
 function updateJobSearch(value, composing = false) {
   clearTimeout(jobSearchTimer); jobSearchVersion++; jobSearchComposing = composing;
   state.jobQuery = value; state.filteredJobs = null; state.jobError = '';
   const table = $('#request-records'); if (table) table.innerHTML = jobTable();
-  if (value.trim() && !composing) jobSearchTimer = setTimeout(loadFilteredJobs, 200);
+  if (hasJobFilter() && !composing) jobSearchTimer = setTimeout(loadFilteredJobs, 200);
 }
 async function loadFilteredJobs() {
   clearTimeout(jobSearchTimer);
-  const version = ++jobSearchVersion, query = state.jobQuery.trim();
-  if (!query || jobSearchComposing) return;
+  const version = ++jobSearchVersion, query = state.jobQuery.trim(), status = state.jobStatus;
+  if (!hasJobFilter() || jobSearchComposing) return;
   try {
-    const result = await api('/jobs/search', { method: 'POST', body: { query } });
-    if (version !== jobSearchVersion || query !== state.jobQuery.trim() || !state.data) return;
+    const result = await api('/jobs/search', { method: 'POST', body: { query, status } });
+    if (version !== jobSearchVersion || query !== state.jobQuery.trim() || status !== state.jobStatus || !state.data) return;
     state.filteredJobs = result.jobs; state.jobError = '';
   } catch (error) {
-    if (version !== jobSearchVersion || query !== state.jobQuery.trim() || !state.data) return;
+    if (version !== jobSearchVersion || query !== state.jobQuery.trim() || status !== state.jobStatus || !state.data) return;
     state.filteredJobs = null; state.jobError = error.message;
   }
   const table = $('#request-records');
@@ -261,8 +262,8 @@ async function loadFilteredJobs() {
 }
 function usageView() {
   const d = state.data;
-  const filter = `<label class="search job-search">${icon('search')}<input id="job-key-search" type="search" placeholder="搜索 Key" aria-label="搜索 Key" value="${e(state.jobQuery)}" maxlength="256" autocomplete="off" spellcheck="false"></label>`;
-  return `<div class="panel"><div class="panel-title"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div>${state.logs === 'jobs' ? filter : ''}</div>${state.logs === 'jobs' ? `<div id="request-records">${jobTable()}</div>` : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
+  const filter = `<div class="request-filters"><div class="tabs" role="group" aria-label="请求状态">${[['all', '全部'], ['failed', '失败'], ['cancelled', '已取消']].map(([status, label]) => `<button data-action="job-status" data-status="${status}" class="${state.jobStatus === status ? 'selected' : ''}" aria-pressed="${state.jobStatus === status}">${label}</button>`).join('')}</div><label class="search job-search">${icon('search')}<input id="job-key-search" type="search" placeholder="搜索 Key" aria-label="搜索 Key" value="${e(state.jobQuery)}" maxlength="256" autocomplete="off" spellcheck="false"></label></div>`;
+  return `<div class="panel"><div class="panel-title request-log-heading"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div>${state.logs === 'jobs' ? filter : ''}</div>${state.logs === 'jobs' ? `<div id="request-records">${jobTable()}</div>` : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
 }
 function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
@@ -309,7 +310,7 @@ function renderView() {
   $('#view').innerHTML = ({ overview, keys: keysView, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
   if (state.view === 'cdks' && !state.cdks) void loadCdks();
-  if (state.view === 'usage' && state.logs === 'jobs' && state.jobQuery.trim()) void loadFilteredJobs();
+  if (state.view === 'usage' && state.logs === 'jobs' && hasJobFilter()) void loadFilteredJobs();
 }
 function stopEvents() { clearTimeout(jobSearchTimer); clearTimeout(liveRetryTimer); liveRetryTimer = null; liveEvents?.close(); liveEvents = null; snapshotVersion++; jobSearchVersion++; }
 function updateQuota(data) {
@@ -321,7 +322,7 @@ function updateQuota(data) {
 function applySnapshot(data) {
   const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
   if (!previous) { settingsDirty = false; shell(); return; }
-  if (state.view === 'usage' && state.logs === 'jobs' && state.jobQuery.trim()) void loadFilteredJobs();
+  if (state.view === 'usage' && state.logs === 'jobs' && hasJobFilter()) void loadFilteredJobs();
   const count = $('.nav-item[href="#keys"] small'); if (count) count.textContent = data.keys.length;
   const connection = $('.connection-state');
   if (connection) {
@@ -440,9 +441,9 @@ async function jobDetail(id) {
   const keyAvailable = state.data.keys.some(key => key.id === j.key_id);
   const mode = ({pool:'账号池', 'opus-pool':'Opus 免费池', 'anlas-pool':'Anlas 余额池', 'nai5-local-stamina':'V5 本地体力池', 'nai5-bound':'旧会员绑定上游', 'nai5-paid-pool':'NAI5 体力耗尽 · Anlas 池', 'nai5-stamina-pool':'NAI5 体力池 · 下游扣点'})[j.route_mode];
   modal('请求详情', '<dl class="details"><dt>请求编号</dt><dd><code>'+e(j.id)+'</code></dd>'+
-    '<dt>访问密钥</dt><dd>'+e(j.key_name)+'<div id="job-key-secret" class="job-key-controls"><code>'+e(j.key_prefix)+'</code><button class="button small subtle" data-action="reveal-job-key" data-id="'+j.key_id+'" '+(keyAvailable ? '' : 'disabled')+'>'+(keyAvailable ? '查看密钥' : '密钥已删除')+'</button></div></dd><dt>计费等级</dt><dd>'+tierName(j.tier_snapshot)+'</dd>'+
-    '<dt>所用上游</dt><dd>'+e(j.upstream_name)+'</dd><dt>路由方式</dt><dd>'+e(mode)+'</dd>'+
-    '<dt>请求接口</dt><dd><code>'+e(j.endpoint)+'</code></dd><dt>上游 HTTP 状态</dt><dd>'+e(j.http_status ?? '—')+'</dd>'+
+    '<dt>访问密钥</dt><dd>'+e(j.key_name ?? '未识别密钥')+'<div id="job-key-secret" class="job-key-controls"><code>'+e(j.key_prefix ?? '—')+'</code><button class="button small subtle" data-action="reveal-job-key" data-id="'+j.key_id+'" '+(keyAvailable ? '' : 'disabled')+'>'+(keyAvailable ? '查看密钥' : j.key_id == null ? '未识别密钥' : '密钥已删除')+'</button></div></dd><dt>计费等级</dt><dd>'+(j.tier_snapshot ? tierName(j.tier_snapshot) : '—')+'</dd>'+
+    '<dt>所用上游</dt><dd>'+e(j.upstream_name || '未选择上游')+'</dd><dt>路由方式</dt><dd>'+e(mode || '—')+'</dd>'+
+    '<dt>请求阶段</dt><dd>'+e(j.stage || '—')+'</dd><dt>请求方法</dt><dd>'+e(j.request_method || 'POST')+'</dd><dt>响应状态</dt><dd>'+e(j.response_status ?? j.http_status ?? '—')+'</dd><dt>请求接口</dt><dd><code>'+e(j.endpoint)+'</code></dd><dt>上游 HTTP 状态</dt><dd>'+e(j.http_status ?? '—')+'</dd>'+
     '<dt>状态</dt><dd>'+badge(j.status)+'</dd><dt>本地报价</dt><dd>'+number(j.reserved)+' Anlas</dd>'+
     '<dt>上游消耗</dt><dd>'+number(j.upstream_spent)+' Anlas</dd>'+
     '<dt>体力消耗</dt><dd>'+(j.stamina_charged === null ? '—' : number(j.stamina_charged/100)+' 张')+'</dd><dt>实际扣点</dt><dd>'+(j.charged === null ? '处理中' : number(j.charged)+' Anlas')+'</dd></dl><p class="info-box">'+e(j.note)+'</p>'+
@@ -482,6 +483,10 @@ document.addEventListener('click', async event => {
   if (action === 'key-detail') return withButton(button, () => detail(id));
   if (action === 'reveal-job-key') return withButton(button, () => revealJobKey(id));
   if (action === 'job') return jobDetail(id);
+  if (action === 'job-status') {
+    if (!['all', 'failed', 'cancelled'].includes(button.dataset.status)) return;
+    state.jobStatus = button.dataset.status; updateJobSearch(state.jobQuery); return renderView();
+  }
   if (action === 'logs') { state.logs = button.dataset.tab; return renderView(); }
   if (action === 'mint-cdks') return mintCdks(id);
   if (action === 'void-cdk') {

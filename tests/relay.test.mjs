@@ -30,6 +30,15 @@ export async function fixture(t, config = {}) {
   return { app,mock,base,call,relay,key,directory,cookie,csrf };
 }
 
+function assertEntryFailures(f, count) {
+  const jobs = f.app.store.jobs(); assert.equal(jobs.length, count);
+  for (const job of jobs) {
+    assert.equal(job.status, 'failed'); assert.equal(job.charged, 0); assert.equal(job.reserved, 0);
+    assert.equal(job.upstream_id, null); assert.ok(job.note); assert.ok(job.response_status >= 400);
+    assert.ok(f.app.store.jobDiagnostics(job.id).failure_detail);
+  }
+}
+
 function launcherForm(body, parts = {}) {
   const form = new FormData();
   for (const [name, bytes] of Object.entries(parts)) form.append(name, new Blob([bytes], { type: 'image/png' }), 'blob');
@@ -263,7 +272,7 @@ test('柏宝绘订阅兼容路径沿用跨域预检、来源限制和密钥校�
     const response = await f.relay(path, undefined, { Origin: origin });
     assert.equal(response.status, 200); assert.equal(response.headers.get('access-control-allow-origin'), origin);
   }
-  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+  assert.equal(f.mock.state.calls.length, 0); assertEntryFailures(f, 8);
 });
 
 test('user/data 普通账号可解析下游套餐、可用余额和有效期，上游故障不影响查询', async t => {
@@ -318,7 +327,7 @@ test('user/data 保留鉴权、有效期、暂停状态和跨域校验，只接�
   assert.equal((await expired.json()).code, 'KEY_EXPIRED');
   f.app.store.updateKey(f.key.id, { expiresAt: null }); f.app.store.set('enabled', 'false');
   assert.equal((await f.relay('/user/data')).status, 503);
-  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+  assert.equal(f.mock.state.calls.length, 0); assertEntryFailures(f, 7);
 });
 
 test('完整密钥可重复查看，仅管理员通过 Origin 和 CSRF 校验后可读取', async t => {
@@ -702,7 +711,7 @@ test('Max 按输出面积检查下游余额，17 Anlas 不足时生成前拒绝'
     assert.equal(response.status, 402); assert.match(await response.text(), /18 Anlas/);
   }
   assert.equal(f.mock.state.calls.filter(c => c.path.startsWith('/ai/')).length, 0);
-  assert.equal(f.app.store.jobs().length, 0); assert.equal(f.app.store.key(f.key.id).reserved, 0);
+  assertEntryFailures(f, 2); assert.equal(f.app.store.key(f.key.id).reserved, 0);
   assert.equal(f.app.store.key(f.key.id).balance, 17);
 });
 
@@ -732,13 +741,13 @@ test('不支持的 Max 请求在查询上游和预留余额前拒绝', async t =
     Object.assign(request, change, { parameters });
     assert.equal((await f.relay('/ai/generate-image', request)).status, 400);
   }
-  assert.equal(f.mock.state.calls.length, 0); assert.equal(f.app.store.jobs().length, 0);
+  assert.equal(f.mock.state.calls.length, 0); assertEntryFailures(f, 5);
 });
 
 test('上游查询失败不发起生成，失效会话及暂停中转正确拒绝', async t => {
   const f=await fixture(t);f.mock.state.queryFails=true;
   assert.equal((await f.relay('/ai/generate-image',payload())).status,502);
-  assert.equal(f.app.store.jobs().length,0);
+  assertEntryFailures(f, 1);
   f.mock.state.queryFails=false;
   await f.call('/admin/api/settings','PUT',{name:'Mock',origins:[],enabled:false});
   assert.equal((await f.relay('/user/subscription')).status,503);
@@ -872,7 +881,7 @@ test('余额仅 1 Anlas 时，240 Anlas 的生成与流式请求在上游调用�
   assert.equal(f.mock.state.calls.filter(c=>c.path==='/ai/generate-image-stream').length,0);
   assert.equal(f.app.store.key(f.key.id).balance,1);
   assert.equal(f.app.store.key(f.key.id).reserved,0);
-  assert.equal(f.app.store.jobs().length,0);
+  assertEntryFailures(f, 2);
 });
 
 test('本地报价 240 就扣 240，上游实扣 220 不改变价格，排队请求不能透支', async t => {
@@ -884,7 +893,7 @@ test('本地报价 240 就扣 240，上游实扣 220 不改变价格，排队请
   assert.equal((await f.call('/admin/api/keys/'+f.key.id+'/points','POST',{delta:-1,note:'不能动预留'})).status,400);
   assert.equal((await pending).status,200); assert.equal((await queued).status,402);
   assert.equal(f.app.store.key(f.key.id).balance,0); assert.equal(f.app.store.key(f.key.id).reserved,0);
-  assert.equal(f.app.store.jobs()[0].charged,240);
+  assert.equal(f.app.store.jobs().find(job => job.status === 'completed').charged,240);
 });
 
 test('本地体力存在而上游耗尽时明确报错，不偷偷扣点或付费生成',async t=>{
@@ -1282,7 +1291,7 @@ test('NAI5 借用其他体力账号仍需下游余额，不能绕过本地报价
   await addAccount(f,'pst-stamina-only',{paid:false,balance:0});
   f.app.store.adjust(f.key.id,-100,'清空下游余额');
   assert.equal((await f.relay('/ai/generate-image',payload())).status,402);
-  assert.equal(generatedCalls(f).length,0); assert.equal(f.app.store.jobs().length,0);
+  assert.equal(generatedCalls(f).length,0); assertEntryFailures(f, 1);
 });
 
 
@@ -1452,6 +1461,6 @@ test('错误重绘画布和强度在上游查询与扣点前被拒绝', async t 
     const parts={image:bytes,mask:bytes};parts[field]=canvasPng(512,768);
     assert.equal((await sendForm(f,'/ai/generate-image-stream',launcherForm({...valid,parameters:{...valid.parameters,image:'image',mask:'mask'}},parts))).status,400);
   }
-  assert.equal(f.mock.state.calls.length,0); assert.equal(f.app.store.jobs().length,0);
+  assert.equal(f.mock.state.calls.length,0); assertEntryFailures(f, 8);
   assert.equal(f.app.store.key(f.key.id).balance,100); assert.equal(f.app.store.key(f.key.id).reserved,0);
 });

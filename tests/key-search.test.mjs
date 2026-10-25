@@ -16,7 +16,7 @@ async function fixture() {
       addEventListener(type, handler) { events[type] = handler; },
       createElement() { return { remove() {} }; },
       querySelector(selector) { return {
-        '#app': {}, '#dialog': { addEventListener() {} }, '#key-table': table,
+        '#app': {}, '#job-parameters-dialog': { addEventListener() {} }, '#dialog': { addEventListener() {} }, '#key-table': table,
         '#toasts': { append(node) { notices.push(node.textContent); } },
       }[selector]; },
     },

@@ -51,7 +51,7 @@ async function fixture({ clipboard, modal = true, legacy = true } = {}) {
   };
   document.activeElement = button;
   document.querySelector = selector => ({
-    '#app': {}, '#dialog': dialog, '#new-token': token, '.address-field code': address,
+    '#app': {}, '#job-parameters-dialog': { addEventListener() {} }, '#dialog': dialog, '#new-token': token, '.address-field code': address,
     '#toasts': { append(node) { notifications.push({ text: node.textContent, bad: node.className.includes('bad') }); } },
   })[selector];
   const context = createContext({

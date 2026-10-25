@@ -19,6 +19,11 @@ const KEY_COLUMNS = `
   stamina_refill_period INTEGER NOT NULL CHECK(stamina_refill_period >= 0),
   CHECK(tier='member' OR (stamina_capacity=0 AND stamina_balance=0 AND stamina_reserved=0))`;
 
+function jobStatuses(status) {
+  assert(['all', 'failed', 'cancelled'].includes(status), '请求状态筛选无效');
+  return status === 'all' ? null : JSON.stringify(status === 'failed' ? ['failed', 'rejected'] : ['cancelled']);
+}
+
 export class Store {
   constructor(directory) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -44,10 +49,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS keys (${KEY_COLUMNS});
       CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys(id), endpoint TEXT NOT NULL, model TEXT,
+        id TEXT PRIMARY KEY, key_id INTEGER REFERENCES keys(id), endpoint TEXT NOT NULL, model TEXT,
         status TEXT NOT NULL, reserved INTEGER NOT NULL, charged INTEGER,
         http_status INTEGER, note TEXT, created_at INTEGER NOT NULL, finished_at INTEGER,
-        upstream_id INTEGER NOT NULL REFERENCES upstreams(id), upstream_name TEXT NOT NULL,
+        upstream_id INTEGER REFERENCES upstreams(id), upstream_name TEXT NOT NULL,
         tier_snapshot TEXT NOT NULL, route_mode TEXT NOT NULL, upstream_estimate INTEGER NOT NULL,
         upstream_spent INTEGER NOT NULL DEFAULT 0,
         stamina_reserved INTEGER NOT NULL DEFAULT 0, stamina_charged INTEGER,
@@ -74,6 +79,24 @@ export class Store {
       this.db.exec('ALTER TABLE jobs ADD COLUMN upstream_spent INTEGER NOT NULL DEFAULT 0');
       this.db.exec("UPDATE jobs SET upstream_spent=upstream_estimate WHERE status='completed' OR (status='resolved' AND charged>0)");
     });
+    // Entry failures may have neither an authenticated key nor a selected upstream.
+    if (this.db.prepare('PRAGMA table_info(jobs)').all().some(c => ['key_id', 'upstream_id'].includes(c.name) && c.notnull)) {
+      const schema = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'").get().sql
+        .replace(/^CREATE TABLE\s+(?:"jobs"|jobs)\s*\(/i, 'CREATE TABLE jobs_new (')
+        .replace(/(key_id|upstream_id) INTEGER NOT NULL/g, '$1 INTEGER');
+      this.db.exec('PRAGMA foreign_keys=OFF');
+      try {
+        this.transaction(() => {
+          this.db.exec(schema);
+          this.db.exec('INSERT INTO jobs_new SELECT * FROM jobs; DROP TABLE jobs; ALTER TABLE jobs_new RENAME TO jobs;');
+          this.db.exec('CREATE INDEX jobs_time ON jobs(created_at DESC); CREATE INDEX jobs_key ON jobs(key_id);');
+          assert(!this.db.prepare('PRAGMA foreign_key_check').all().length, '请求记录迁移外键校验失败', 500);
+        });
+      } finally { this.db.exec('PRAGMA foreign_keys=ON'); }
+    }
+    const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all();
+    for (const [name, type] of [['request_method', 'TEXT'], ['stage', 'TEXT'], ['response_status', 'INTEGER'], ['client_disconnected_at', 'INTEGER']])
+      if (!jobColumns.some(c => c.name === name)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${type}`);
     if (!this.db.prepare('PRAGMA table_info(keys)').all().some(c => c.name === 'retired_at'))
       this.db.exec('ALTER TABLE keys ADD COLUMN retired_at INTEGER');
     this.db.exec(`CREATE TABLE IF NOT EXISTS cdks (
@@ -89,6 +112,8 @@ export class Store {
     this.db.prepare("UPDATE jobs SET status='running' WHERE status='review'").run();
     for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='running'").all())
       this.fail(job.id, '服务中断，任务失败，已自动释放预留点数和体力');
+    for (const job of this.db.prepare("SELECT id FROM jobs WHERE status='pending'").all())
+      this.finishPending(job.id, '服务中断，请求尚未转发上游，未扣点数', 503);
     try { grantFullStaminaOnce(this.db); } catch (error) { this.db.close(); throw error; }
     this.db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
     if (!this.get('admin_password') && !this.get('setup_hash')) {
@@ -316,6 +341,27 @@ export class Store {
       if (delta !== 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,created_at) VALUES(?,?,?,?,?)').run(id, delta, 'adjust', note, Date.now());
     });
   }
+  beginRequest(id, endpoint, method, token) {
+    // Resolve identity without accepting a disabled, expired or retired credential.
+    const key = token ? this.db.prepare('SELECT id,tier FROM keys WHERE token_hash=?').get(hash(token)) : null;
+    this.db.prepare(`INSERT INTO jobs(id,key_id,endpoint,status,reserved,created_at,upstream_name,tier_snapshot,route_mode,upstream_estimate,request_method,stage)
+      VALUES(?,?,?,'pending',0,?,'',?,'',0,?,'入口校验')`).run(id, key?.id ?? null, endpoint, Date.now(), key?.tier ?? '', method);
+    this.onChange?.();
+  }
+  requestStage(id, stage, model = null) {
+    this.db.prepare("UPDATE jobs SET stage=?,model=COALESCE(?,model) WHERE id=? AND status='pending'").run(stage, model, id);
+    this.onChange?.();
+  }
+  finishPending(id, note, responseStatus, cancelled = false) {
+    const result = this.db.prepare(`UPDATE jobs SET status=?,note=?,response_status=?,charged=0,stamina_charged=0,finished_at=?
+      WHERE id=? AND status='pending'`).run(cancelled ? 'cancelled' : 'failed', note, responseStatus, Date.now(), id);
+    if (result.changes) this.onChange?.();
+    return !!result.changes;
+  }
+  clientDisconnected(id) {
+    this.db.prepare("UPDATE jobs SET client_disconnected_at=? WHERE id=? AND status IN ('pending','running')").run(Date.now(), id);
+    this.onChange?.();
+  }
   reserve(keyId, id, endpoint, model, amount, idempotency, upstreamId, { mode = 'pool', upstreamEstimate = 0, stamina = 0 } = {}) {
     this.transaction(() => {
       const key = this.usableKey(keyId); integer(amount, 0, 1_000_000_000);
@@ -326,7 +372,14 @@ export class Store {
       const selected = this.upstream(upstreamId ?? -1);
       assert(selected?.enabled, '选定上游已停用，请重新查询额度', 409);
       if (idempotency) assert(!this.db.prepare('SELECT id FROM jobs WHERE key_id=? AND idempotency=?').get(keyId, idempotency), '该请求已受理，请勿重复提交', 409);
-      this.db.prepare("INSERT INTO jobs(id,key_id,endpoint,model,status,reserved,created_at,idempotency,upstream_id,upstream_name,tier_snapshot,route_mode,upstream_estimate,stamina_reserved) VALUES(?,?,?,?,'running',?,?,?,?,?,?,?,?,?)").run(id,keyId,endpoint,model,amount,Date.now(),idempotency,upstreamId,selected.name,key.tier,mode,upstreamEstimate,stamina);
+      const existing = this.db.prepare('SELECT status FROM jobs WHERE id=?').get(id);
+      assert(!existing || existing.status === 'pending', '请求已结束', 499);
+      this.db.prepare(`INSERT INTO jobs(id,key_id,endpoint,model,status,reserved,created_at,idempotency,upstream_id,upstream_name,tier_snapshot,route_mode,upstream_estimate,stamina_reserved)
+        VALUES(?,?,?,?,'running',?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        model=excluded.model,status='running',reserved=excluded.reserved,idempotency=excluded.idempotency,
+        upstream_id=excluded.upstream_id,upstream_name=excluded.upstream_name,tier_snapshot=excluded.tier_snapshot,
+        route_mode=excluded.route_mode,upstream_estimate=excluded.upstream_estimate,stamina_reserved=excluded.stamina_reserved,stage='上游执行'`)
+        .run(id,keyId,endpoint,model,amount,Date.now(),idempotency,upstreamId,selected.name,key.tier,mode,upstreamEstimate,stamina);
       this.db.prepare('UPDATE keys SET reserved=reserved+?,stamina_reserved=stamina_reserved+?,last_used_at=? WHERE id=?').run(amount,stamina,Date.now(),keyId);
     });
   }
@@ -337,6 +390,7 @@ export class Store {
       assert(['completed', 'failed'].includes(status), '任务只能按成功或失败结算');
       assert(charged === (status === 'completed' ? job.reserved : 0), '成功按本地报价结算，失败释放全部预留');
       const staminaCharged = status === 'completed' ? job.stamina_reserved : 0;
+      if (job.client_disconnected_at) note += '；客户端已断开连接，按上游结果结算';
       this.db.prepare('UPDATE keys SET reserved=reserved-?,balance=balance-?,stamina_reserved=stamina_reserved-?,stamina_balance=stamina_balance-? WHERE id=?').run(job.reserved,charged,job.stamina_reserved,staminaCharged,job.key_id);
       this.db.prepare('UPDATE jobs SET status=?,charged=?,upstream_spent=?,http_status=?,note=?,finished_at=?,stamina_charged=? WHERE id=?').run(status,charged,status === 'completed' ? job.upstream_estimate : 0,http,note,Date.now(),staminaCharged,id);
       if (charged > 0) this.db.prepare('INSERT INTO ledger(key_id,delta,kind,note,job_id,created_at) VALUES(?,?,?,?,?,?)').run(job.key_id, -charged, 'usage', note, id, Date.now());
@@ -345,17 +399,22 @@ export class Store {
   fail(id, note, http = null) {
     if (this.db.prepare("SELECT id FROM jobs WHERE id=? AND status='running'").get(id)) this.settle(id, 0, 'failed', note, http);
   }
-  jobs(limit = 100, keyId = null) {
-    const query = `SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs JOIN keys ON keys.id=jobs.key_id
-      ${keyId === null ? '' : 'WHERE jobs.key_id=?'} ORDER BY jobs.rowid DESC LIMIT ?`;
-    return this.db.prepare(query).all(...(keyId === null ? [limit] : [keyId, limit]));
+  jobs(limit = 100, keyId = null, status = 'all') {
+    const statuses = jobStatuses(status);
+    const query = `SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs LEFT JOIN keys ON keys.id=jobs.key_id
+      WHERE (? IS NULL OR jobs.key_id=?) AND (? IS NULL OR jobs.status IN (SELECT value FROM json_each(?)))
+      ORDER BY jobs.rowid DESC LIMIT ?`;
+    return this.db.prepare(query).all(keyId, keyId, statuses, statuses, limit);
   }
-  searchJobs(query, limit = 100) {
-    if (!query.trim()) return this.jobs(limit);
+  searchJobs(query, limit = 100, status = 'all') {
+    const statuses = jobStatuses(status);
+    if (!query.trim()) return this.jobs(limit, null, status);
     const ids = this.searchKeys(query.trim(), { includeRetired: true });
     if (!ids.length) return [];
     return this.db.prepare(`SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs JOIN keys ON keys.id=jobs.key_id
-      WHERE jobs.key_id IN (SELECT value FROM json_each(?)) ORDER BY jobs.rowid DESC LIMIT ?`).all(JSON.stringify(ids), limit);
+      WHERE jobs.key_id IN (SELECT value FROM json_each(?))
+      AND (? IS NULL OR jobs.status IN (SELECT value FROM json_each(?)))
+      ORDER BY jobs.rowid DESC LIMIT ?`).all(JSON.stringify(ids), statuses, statuses, limit);
   }
   saveJobDiagnostics(id, { request = null, upstreamError = null, failure = null, contentType = null } = {}) {
     this.db.prepare(`INSERT INTO job_diagnostics(job_id,request_json,upstream_error,failure_detail,response_content_type) VALUES(?,?,?,?,?)
