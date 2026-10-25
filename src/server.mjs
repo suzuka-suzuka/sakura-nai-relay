@@ -56,8 +56,8 @@ export function createApp(config) {
     return csrf;
   }
   function snapshot() {
-    const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs`).get();
-    const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
+    const stats = store.db.prepare(`SELECT COUNT(*) AS requests, COALESCE(SUM(charged),0) AS spent, COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE status!='pending'`).get();
+    const trend = store.db.prepare("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch','+8 hours') AS day, COUNT(*) AS requests,COALESCE(SUM(charged),0) AS spent,COALESCE(SUM(upstream_spent),0) AS upstreamSpent FROM jobs WHERE status!='pending' AND created_at>? GROUP BY day").all(Date.now() - 7 * 86400000);
     return { settings: options(), upstreams: store.upstreams().map(r => router.status(r)), keys: store.keys().map(key => ({ ...key, expired: key.expires_at !== null && key.expires_at <= Date.now() })), jobs: store.jobs(), ledger: store.ledger(), stats, trend, cdks: { products: store.cdkSummary(), redemptions: store.cdkRedemptions() }, busy: router.busy.size > 0, relayUrl: config.relayUrl || config.publicOrigin, redeemUrl: config.redeemUrl || `${config.publicOrigin}/redeem` };
   }
   async function readQuota() {

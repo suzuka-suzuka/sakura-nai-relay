@@ -95,7 +95,7 @@ test('重复幂等请求有独立失败记录，原任务保持一次结算', as
   assert.equal(f.state.generations, 1); assert.equal(f.app.store.key(f.key.id).balance, 974);
 });
 
-test('密钥和上游排队时立即可见，真实断连记录取消，不预留或扣费', async t => {
+test('密钥和上游排队时仅持久化，真实断连后显示取消，不预留或扣费', async t => {
   for (const queue of ['key', 'upstream']) await t.test(queue, async t => {
     const f = await fixture(t);
     const unlock = queue === 'key' ? await f.app.router.lockKey(f.key.id) : await f.app.router.lockUpstream(1);
@@ -103,7 +103,9 @@ test('密钥和上游排队时立即可见，真实断连记录取消，不预�
       const controller = new AbortController();
       const request = f.send({ signal: controller.signal }).catch(error => error);
       await until(() => (queue === 'key' ? f.app.router.keyQueue.size(f.key.id) : f.app.router.upstreamQueue.size(1)) === 2);
-      const job = f.app.store.jobs()[0]; assert.equal(job.status, 'pending'); assert.match(job.stage, /排队/);
+      const job = f.app.store.db.prepare("SELECT * FROM jobs WHERE status='pending'").get();
+      assert.equal(job.status, 'pending'); assert.match(job.stage, /排队/);
+      assert.deepEqual(f.app.store.jobs(), []); assert.deepEqual(f.app.store.searchJobs(f.key.token), []);
       controller.abort(); await request;
       await until(() => f.app.store.jobs()[0]?.status === 'cancelled');
       const cancelled = f.app.store.jobs()[0];
@@ -118,7 +120,7 @@ test('上传中断和请求体过大也能保存，已开始生成后断连仍�
   const f = await fixture(t);
   const partial = httpRequest(f.base + path, { method: 'POST', headers: { ...f.headers, 'Content-Length': '1000' } });
   partial.on('error', () => {}); partial.write('{');
-  await until(() => f.app.store.jobs()[0]?.stage === '读取请求'); partial.destroy();
+  await until(() => f.app.store.db.prepare("SELECT id FROM jobs WHERE stage='读取请求'").get()); partial.destroy();
   await until(() => f.app.store.jobs()[0]?.status === 'cancelled');
   assert.match(f.app.store.jobs()[0].note, /断开/);
   await new Promise((resolve, reject) => {

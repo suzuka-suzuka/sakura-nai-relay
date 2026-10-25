@@ -346,11 +346,10 @@ export class Store {
     const key = token ? this.db.prepare('SELECT id,tier FROM keys WHERE token_hash=?').get(hash(token)) : null;
     this.db.prepare(`INSERT INTO jobs(id,key_id,endpoint,status,reserved,created_at,upstream_name,tier_snapshot,route_mode,upstream_estimate,request_method,stage)
       VALUES(?,?,?,'pending',0,?,'',?,'',0,?,'入口校验')`).run(id, key?.id ?? null, endpoint, Date.now(), key?.tier ?? '', method);
-    this.onChange?.();
+    // Persist early failures, but publish only after routing or a terminal outcome.
   }
   requestStage(id, stage, model = null) {
     this.db.prepare("UPDATE jobs SET stage=?,model=COALESCE(?,model) WHERE id=? AND status='pending'").run(stage, model, id);
-    this.onChange?.();
   }
   finishPending(id, note, responseStatus, cancelled = false) {
     const result = this.db.prepare(`UPDATE jobs SET status=?,note=?,response_status=?,charged=0,stamina_charged=0,finished_at=?
@@ -402,7 +401,7 @@ export class Store {
   jobs(limit = 100, keyId = null, status = 'all') {
     const statuses = jobStatuses(status);
     const query = `SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs LEFT JOIN keys ON keys.id=jobs.key_id
-      WHERE (? IS NULL OR jobs.key_id=?) AND (? IS NULL OR jobs.status IN (SELECT value FROM json_each(?)))
+      WHERE jobs.status!='pending' AND (? IS NULL OR jobs.key_id=?) AND (? IS NULL OR jobs.status IN (SELECT value FROM json_each(?)))
       ORDER BY jobs.rowid DESC LIMIT ?`;
     return this.db.prepare(query).all(keyId, keyId, statuses, statuses, limit);
   }
@@ -412,7 +411,7 @@ export class Store {
     const ids = this.searchKeys(query.trim(), { includeRetired: true });
     if (!ids.length) return [];
     return this.db.prepare(`SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs JOIN keys ON keys.id=jobs.key_id
-      WHERE jobs.key_id IN (SELECT value FROM json_each(?))
+      WHERE jobs.status!='pending' AND jobs.key_id IN (SELECT value FROM json_each(?))
       AND (? IS NULL OR jobs.status IN (SELECT value FROM json_each(?)))
       ORDER BY jobs.rowid DESC LIMIT ?`).all(JSON.stringify(ids), statuses, statuses, limit);
   }

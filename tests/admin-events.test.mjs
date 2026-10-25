@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createApp } from '../src/server.mjs';
 import { mockUpstream } from './mock.mjs';
 
@@ -91,18 +92,50 @@ test('两条 SSE 连接同步收到余额、流水、兑换库存与兑换记录
 test('真实生成执行中及结算后推送状态、扣点、上游忙闲和额度', async t => {
   const f = await fixture(t), stream = await f.stream();
   await stream.next('snapshot'); await stream.next('quota'); f.mock.state.slow = 200;
+  const unlock = await f.app.router.lockKey(f.key.id); t.after(unlock);
   const pending = fetch(f.base + '/ai/generate-image', {
     method: 'POST', headers: { Authorization: `Bearer ${f.key.token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: 'nai-diffusion-5-full', action: 'generate', input: 'test', parameters: { width: 832, height: 1216, steps: 23, n_samples: 1 } }),
   });
-  const running = await stream.next('snapshot', data => data.jobs[0]?.status === 'running');
+  for (let i = 0; i < 200 && f.app.router.keyQueue.size(f.key.id) < 2; i++) await delay(10);
+  assert.equal(f.app.router.keyQueue.size(f.key.id), 2);
+  f.app.store.adjust(f.key.id, 1, '触发独立快照');
+  const waiting = await stream.next('snapshot', data => data.keys[0].balance === 101);
+  assert.deepEqual(waiting.jobs, []); assert.equal(waiting.stats.requests, 0); assert.deepEqual(waiting.trend, []);
+  const reconnected = await f.stream(); assert.deepEqual((await reconnected.next('snapshot')).jobs, []);
+  assert.deepEqual((await (await f.call('/admin/api/jobs')).json()).jobs, []);
+  assert.deepEqual((await (await f.call('/admin/api/jobs/search', 'POST', { query: f.key.token, status: 'all' })).json()).jobs, []);
+  unlock();
+  // The first published row already has a committed upstream, without a pending placeholder.
+  const running = await stream.next('snapshot', data => data.jobs.length > 0);
+  assert.equal(running.jobs[0].status, 'running'); assert.equal(running.jobs[0].upstream_id, 1);
+  assert.equal(running.jobs[0].upstream_name, 'Mock');
   assert.equal(running.busy, true); assert.equal(running.keys[0].reserved, 26);
   const response = await pending; assert.equal(response.status, 200); await response.arrayBuffer();
   const completed = await stream.next('snapshot', data => data.jobs[0]?.status === 'completed' && !data.busy);
-  assert.equal(completed.keys[0].balance, 74); assert.equal(completed.keys[0].reserved, 0);
+  assert.equal(completed.keys[0].balance, 75); assert.equal(completed.keys[0].reserved, 0);
   assert.equal(completed.stats.spent, 26); assert.equal(completed.ledger[0].kind, 'usage');
   const quota = await stream.next('quota', data => data.totalAnlas === 9974);
   assert.equal(quota.failed, 0);
+});
+
+test('选上游前失败和取消直接推送最终记录，不丢失原因或状态筛选', async t => {
+  const f = await fixture(t), stream = await f.stream(); await stream.next('snapshot');
+  const response = await fetch(f.base + '/ai/generate-image', {
+    method: 'POST', headers: { Authorization: `Bearer ${f.key.token}`, 'Content-Type': 'application/json' }, body: '{invalid',
+  });
+  assert.equal(response.status, 400);
+  const failed = await stream.next('snapshot', data => data.jobs.length > 0);
+  assert.equal(failed.jobs[0].status, 'failed'); assert.match(failed.jobs[0].note, /JSON/);
+  assert.equal(failed.jobs[0].upstream_id, null); assert.equal(failed.stats.requests, 1);
+  f.app.store.beginRequest('cancelled-before-routing', '/ai/generate-image', 'POST', f.key.token);
+  f.app.store.requestStage('cancelled-before-routing', '密钥排队');
+  f.app.store.finishPending('cancelled-before-routing', '排队请求已取消', 499, true);
+  const cancelled = await stream.next('snapshot', data => data.jobs[0]?.status === 'cancelled');
+  assert.equal(cancelled.jobs[0].id, 'cancelled-before-routing'); assert.match(cancelled.jobs[0].note, /排队请求已取消/);
+  assert.equal(cancelled.stats.requests, 2);
+  const filtered = await (await f.call('/admin/api/jobs/search', 'POST', { query: f.key.token, status: 'cancelled' })).json();
+  assert.deepEqual(filtered.jobs.map(job => job.id), ['cancelled-before-routing']);
 });
 
 test('上游新增的兑换码作废功能会实时更新库存，作废已兑换码也推送密钥停用状态', async t => {
