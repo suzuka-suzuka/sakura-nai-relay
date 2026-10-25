@@ -20,7 +20,7 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', jobStatus: 'all', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
+const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', jobStatus: 'completed', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
 let jobSearchVersion = 0, jobSearchTimer, jobSearchComposing = false;
 const jobParameterSources = new WeakMap();
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
@@ -228,23 +228,22 @@ async function searchKeys() {
     toast(error.message, true);
   }
 }
-function hasJobFilter() { return !!state.jobQuery.trim() || state.jobStatus !== 'all'; }
-function visibleJobs() { return hasJobFilter() ? state.filteredJobs ?? [] : state.data.jobs; }
+function visibleJobs() { return state.filteredJobs ?? []; }
 function jobTable() {
-  if (hasJobFilter() && state.filteredJobs === null) return empty(state.jobError || '加载中…', '');
+  if (state.filteredJobs === null) return empty(state.jobError || '加载中…', '');
   const rows = visibleJobs();
-  return rows.length ? `<div class="table-scroll"><table class="request-table"><thead><tr><th>请求 / 时间</th><th>Key</th><th>上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${rows.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><span class="request-line">${date(j.created_at)}</span></td><td><span class="request-key-name">${e(j.key_name ?? '未识别密钥')}</span><code class="request-line">${e(j.key_prefix ?? '—')}</code></td><td>${e(j.upstream_name || '未选择上游')}</td><td><span class="model-name">${e(j.model || '—')}</span><span class="request-line">${e(j.endpoint.replace('/ai/', ''))}</span></td><td>${badge(j.status)}${['failed', 'cancelled'].includes(j.status) ? `<span class="request-line request-reason">${e((j.note || '').slice(0, 80))}${j.note?.length > 80 ? '…' : ''}</span>` : ''}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty(hasJobFilter() ? '没有匹配的请求记录' : '暂无请求记录', '');
+  return rows.length ? `<div class="table-scroll"><table class="request-table"><colgroup><col class="request-col-time"><col class="request-col-key"><col class="request-col-upstream"><col class="request-col-model"><col class="request-col-status"><col class="request-col-anlas"><col class="request-col-actions"></colgroup><thead><tr><th>请求 / 时间</th><th>Key</th><th>上游</th><th>模型 / 功能</th><th>状态</th><th>Anlas</th><th></th></tr></thead><tbody>${rows.map(j => `<tr><td><code class="job-id">${e(j.id.slice(0,10))}</code><span class="request-line">${date(j.created_at)}</span></td><td><span class="request-key-name">${e(j.key_name ?? '未识别密钥')}</span><code class="request-line">${e(j.key_prefix ?? '—')}</code></td><td>${e(j.upstream_name || '未选择上游')}</td><td><span class="model-name">${e(j.model || '—')}</span><span class="request-line">${e(j.endpoint.replace('/ai/', ''))}</span></td><td>${badge(j.status)}${['failed', 'cancelled'].includes(j.status) ? `<span class="request-line request-reason">${e((j.note || '').slice(0, 80))}${j.note?.length > 80 ? '…' : ''}</span>` : ''}</td><td><strong>${j.charged === null ? '—' : number(j.charged)}</strong></td><td><button class="button small subtle" data-action="job" data-id="${e(j.id)}">详情</button></td></tr>`).join('')}</tbody></table></div>` : empty('没有匹配的请求记录', '');
 }
 function updateJobSearch(value, composing = false) {
   clearTimeout(jobSearchTimer); jobSearchVersion++; jobSearchComposing = composing;
   state.jobQuery = value; state.filteredJobs = null; state.jobError = '';
   const table = $('#request-records'); if (table) table.innerHTML = jobTable();
-  if (hasJobFilter() && !composing) jobSearchTimer = setTimeout(loadFilteredJobs, 200);
+  if (!composing) jobSearchTimer = setTimeout(loadFilteredJobs, 200);
 }
 async function loadFilteredJobs() {
   clearTimeout(jobSearchTimer);
   const version = ++jobSearchVersion, query = state.jobQuery.trim(), status = state.jobStatus;
-  if (!hasJobFilter() || jobSearchComposing) return;
+  if (!state.data || jobSearchComposing) return;
   try {
     const result = await api('/jobs/search', { method: 'POST', body: { query, status } });
     if (version !== jobSearchVersion || query !== state.jobQuery.trim() || status !== state.jobStatus || !state.data) return;
@@ -262,7 +261,7 @@ async function loadFilteredJobs() {
 }
 function usageView() {
   const d = state.data;
-  const filter = `<div class="request-filters"><div class="tabs" role="group" aria-label="请求状态">${[['all', '全部'], ['failed', '失败'], ['cancelled', '已取消']].map(([status, label]) => `<button data-action="job-status" data-status="${status}" class="${state.jobStatus === status ? 'selected' : ''}" aria-pressed="${state.jobStatus === status}">${label}</button>`).join('')}</div><label class="search job-search">${icon('search')}<input id="job-key-search" type="search" placeholder="搜索 Key" aria-label="搜索 Key" value="${e(state.jobQuery)}" maxlength="256" autocomplete="off" spellcheck="false"></label></div>`;
+  const filter = `<div class="request-filters"><div class="tabs" role="group" aria-label="请求状态">${[['completed', '成功'], ['failed', '失败'], ['cancelled', '已取消']].map(([status, label]) => `<button data-action="job-status" data-status="${status}" class="${state.jobStatus === status ? 'selected' : ''}" aria-pressed="${state.jobStatus === status}">${label}</button>`).join('')}</div><label class="search job-search">${icon('search')}<input id="job-key-search" type="search" placeholder="搜索 Key" aria-label="搜索 Key" value="${e(state.jobQuery)}" maxlength="256" autocomplete="off" spellcheck="false"></label></div>`;
   return `<div class="panel"><div class="panel-title request-log-heading"><div class="tabs"><button data-action="logs" data-tab="jobs" class="${state.logs === 'jobs' ? 'selected' : ''}">请求记录</button><button data-action="logs" data-tab="ledger" class="${state.logs === 'ledger' ? 'selected' : ''}">Anlas 流水</button></div>${state.logs === 'jobs' ? filter : ''}</div>${state.logs === 'jobs' ? `<div id="request-records">${jobTable()}</div>` : (d.ledger.length ? `<div class="table-scroll"><table><thead><tr><th>时间</th><th>访问密钥</th><th>类型</th><th>Anlas 变化</th><th>备注</th></tr></thead><tbody>${d.ledger.map(l => `<tr><td class="date-cell">${date(l.created_at)}</td><td>${e(l.key_name)}</td><td>${({ grant: '创建分配', adjust: '管理调整', usage: '用量结算' })[l.kind]}</td><td><strong class="${l.delta > 0 ? 'positive' : ''}">${l.delta > 0 ? '+' : ''}${number(l.delta)}</strong></td><td>${e(l.note)}</td></tr>`).join('')}</tbody></table></div>` : empty('暂无 Anlas 流水', ''))}</div>`;
 }
 function settingsView() {
@@ -310,7 +309,7 @@ function renderView() {
   $('#view').innerHTML = ({ overview, keys: keysView, cdks: cdksView, usage: usageView, settings: settingsView })[state.view]();
   if (state.view === 'keys' && state.filter.trim()) void searchKeys();
   if (state.view === 'cdks' && !state.cdks) void loadCdks();
-  if (state.view === 'usage' && state.logs === 'jobs' && hasJobFilter()) void loadFilteredJobs();
+  if (state.view === 'usage' && state.logs === 'jobs') void loadFilteredJobs();
 }
 function stopEvents() { clearTimeout(jobSearchTimer); clearTimeout(liveRetryTimer); liveRetryTimer = null; liveEvents?.close(); liveEvents = null; snapshotVersion++; jobSearchVersion++; }
 function updateQuota(data) {
@@ -322,7 +321,7 @@ function updateQuota(data) {
 function applySnapshot(data) {
   const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
   if (!previous) { settingsDirty = false; shell(); return; }
-  if (state.view === 'usage' && state.logs === 'jobs' && hasJobFilter()) void loadFilteredJobs();
+  if (state.view === 'usage' && state.logs === 'jobs') void loadFilteredJobs();
   const count = $('.nav-item[href="#keys"] small'); if (count) count.textContent = data.keys.length;
   const connection = $('.connection-state');
   if (connection) {
@@ -484,7 +483,7 @@ document.addEventListener('click', async event => {
   if (action === 'reveal-job-key') return withButton(button, () => revealJobKey(id));
   if (action === 'job') return jobDetail(id);
   if (action === 'job-status') {
-    if (!['all', 'failed', 'cancelled'].includes(button.dataset.status)) return;
+    if (!['completed', 'failed', 'cancelled'].includes(button.dataset.status)) return;
     state.jobStatus = button.dataset.status; updateJobSearch(state.jobQuery); return renderView();
   }
   if (action === 'logs') { state.logs = button.dataset.tab; return renderView(); }

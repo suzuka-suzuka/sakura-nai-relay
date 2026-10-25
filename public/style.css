@@ -34,3 +34,8 @@ select{display:block;width:100%;margin-top:9px;padding:12px 13px;border:1px soli
 
 .request-filters{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:12px;max-width:100%}.request-filters .tabs{flex-shrink:0}.request-filters .job-search{min-width:0}@media(max-width:740px){.request-filters{width:100%;justify-content:flex-start}}
 .request-log-heading{flex-wrap:wrap}
+html{scrollbar-gutter:stable}
+.request-table{table-layout:fixed;width:100%;min-width:1120px;white-space:normal}
+.request-table .request-col-time{width:16%}.request-table .request-col-key{width:17%}.request-table .request-col-upstream{width:12%}.request-table .request-col-model{width:21%}.request-table .request-col-status{width:17%}.request-table .request-col-anlas{width:9%}.request-table .request-col-actions{width:8%}
+.request-table th,.request-table td{padding-left:16px;padding-right:16px;overflow-wrap:anywhere;vertical-align:top}
+.request-table th,.request-table td:nth-child(6),.request-table td:nth-child(7){white-space:nowrap}

@@ -20,8 +20,8 @@ const KEY_COLUMNS = `
   CHECK(tier='member' OR (stamina_capacity=0 AND stamina_balance=0 AND stamina_reserved=0))`;
 
 function jobStatuses(status) {
-  assert(['all', 'failed', 'cancelled'].includes(status), '请求状态筛选无效');
-  return status === 'all' ? null : JSON.stringify(status === 'failed' ? ['failed', 'rejected'] : ['cancelled']);
+  assert(['all', 'completed', 'failed', 'cancelled'].includes(status), '请求状态筛选无效');
+  return status === 'all' ? null : JSON.stringify(status === 'failed' ? ['failed', 'rejected'] : [status]);
 }
 
 export class Store {
