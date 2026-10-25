@@ -169,10 +169,10 @@ export class Store {
     const key = this.key(id); assert(key, '密钥不存在', 404);
     return { id: key.id, token: unseal(key.token_encrypted, this.master) };
   }
-  searchKeys(query) {
-    const text = query.toLowerCase();
-    return this.db.prepare('SELECT id,name,prefix,token_encrypted FROM keys WHERE retired_at IS NULL ORDER BY id DESC').all()
-      .filter(key => key.name.toLowerCase().includes(text) || key.prefix.toLowerCase().includes(text) || unseal(key.token_encrypted, this.master).includes(query))
+  searchKeys(query, { includeRetired = false } = {}) {
+    const text = query.toLowerCase(), tokenHash = hash(query);
+    return this.db.prepare(`SELECT id,name,prefix,token_hash,token_encrypted FROM keys ${includeRetired ? '' : 'WHERE retired_at IS NULL'} ORDER BY id DESC`).all()
+      .filter(key => key.name.toLowerCase().includes(text) || key.prefix.toLowerCase().includes(text) || key.token_hash === tokenHash || (key.token_encrypted && unseal(key.token_encrypted, this.master).includes(query)))
       .map(key => key.id);
   }
   recordName(name, table) {
@@ -350,9 +350,12 @@ export class Store {
       ${keyId === null ? '' : 'WHERE jobs.key_id=?'} ORDER BY jobs.rowid DESC LIMIT ?`;
     return this.db.prepare(query).all(...(keyId === null ? [limit] : [keyId, limit]));
   }
-  jobKeys() {
-    return this.db.prepare(`SELECT id,name,prefix,retired_at FROM keys
-      WHERE retired_at IS NULL OR EXISTS (SELECT 1 FROM jobs WHERE jobs.key_id=keys.id) ORDER BY id DESC`).all();
+  searchJobs(query, limit = 100) {
+    if (!query.trim()) return this.jobs(limit);
+    const ids = this.searchKeys(query.trim(), { includeRetired: true });
+    if (!ids.length) return [];
+    return this.db.prepare(`SELECT jobs.*,keys.name AS key_name,keys.prefix AS key_prefix FROM jobs JOIN keys ON keys.id=jobs.key_id
+      WHERE jobs.key_id IN (SELECT value FROM json_each(?)) ORDER BY jobs.rowid DESC LIMIT ?`).all(JSON.stringify(ids), limit);
   }
   saveJobDiagnostics(id, { request = null, upstreamError = null, failure = null, contentType = null } = {}) {
     this.db.prepare(`INSERT INTO job_diagnostics(job_id,request_json,upstream_error,failure_detail,response_content_type) VALUES(?,?,?,?,?)

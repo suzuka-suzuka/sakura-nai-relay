@@ -29,13 +29,11 @@ test('管理员按 Key 查询完整历史中的最近 100 条，保留已删除 
   const snapshot = await (await get('/snapshot')).json();
   assert.equal(snapshot.jobs.length, 100);
   assert.ok(snapshot.jobs.every(j => j.key_id === b.id));
-  assert.ok(snapshot.jobKeys.find(k => k.id === a.id).retired_at);
-  assert.ok(snapshot.jobKeys.find(k => k.id === unused.id));
   const { jobs } = await (await get('/jobs?keyId=' + a.id)).json();
   assert.equal(jobs.length, 100);
   assert.equal(jobs[0].id, 'old-104'); assert.equal(jobs[99].id, 'old-5');
   assert.ok(jobs.every(j => j.key_id === a.id && j.key_prefix === prefixA));
-  const encoded = JSON.stringify({ jobs, keys: snapshot.jobKeys });
+  const encoded = JSON.stringify({ jobs });
   for (const secret of [a.token, b.token, 'token_hash', 'token_encrypted', 'pst-filter-test']) assert.ok(!encoded.includes(secret));
   assert.deepEqual((await (await get('/jobs?keyId=' + unused.id)).json()).jobs, []);
   assert.deepEqual((await (await get('/jobs?keyId=999999')).json()).jobs, []);
@@ -43,22 +41,40 @@ test('管理员按 Key 查询完整历史中的最近 100 条，保留已删除 
     assert.equal((await get('/jobs?keyId=' + value)).status, 400);
   }
   assert.deepEqual((await (await get('/jobs')).json()).jobs, snapshot.jobs);
+  const search = (query, headers = {}) => fetch(base + '/jobs/search', { method: 'POST', headers: {
+    Cookie: 'sakura_session=filter-admin', Origin: 'http://localhost:3100', 'X-CSRF-Token': 'csrf',
+    'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ query }) });
+  for (const query of [prefixA, a.token, '  ' + prefixA + '  ']) {
+    const result = await search(query); assert.equal(result.status, 200);
+    assert.deepEqual((await result.json()).jobs, jobs);
+  }
+  for (const query of [b.token, b.token.slice(-8), store.key(b.id).prefix, '同名']) {
+    const result = await search(query); assert.equal(result.status, 200);
+    assert.deepEqual((await result.json()).jobs, snapshot.jobs);
+  }
+  assert.deepEqual((await (await search('   ')).json()).jobs, snapshot.jobs);
+  for (const query of ['不存在的名称', '未使用', "%_' OR 1=1"]) assert.deepEqual((await (await search(query)).json()).jobs, []);
+  assert.equal((await search(b.token, { Cookie: '' })).status, 401);
+  assert.equal((await search(b.token, { 'X-CSRF-Token': '' })).status, 403);
+  for (const query of [null, 123, 'a'.repeat(257)]) assert.equal((await search(query)).status, 400);
+  assert.ok(!store.searchKeys(prefixA).includes(a.id));
+
 });
 
 const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
 function ui() {
-  const context = createContext({ document: { querySelector: () => null } });
+  const context = createContext({ clearTimeout, setTimeout, document: { querySelector: () => null } });
   runInContext(source.slice(0, source.indexOf("document.addEventListener('click'")), context);
-  runInContext("state.data = { keys: [], jobKeys: [{ id: 1, name: '<同名>', prefix: 'sk-a…1', retired_at: 1 }], jobs: [], ledger: [] };", context);
+  runInContext("state.data = { keys: [], jobs: [], ledger: [] };", context);
   return context;
 }
 const job = id => ({ id, key_id: 1, key_name: '<同名>', key_prefix: 'sk-a…1', endpoint: '/ai/generate-image', model: 'nai-diffusion-4', status: 'completed' });
 
 test('请求列表用正常字号标识 Key，筛选旧记录后详情仍可打开', async () => {
   const context = ui(); context.rows = [job('old-request')];
-  runInContext("state.jobKey = '1'; state.filteredJobs = rows;", context);
+  runInContext("state.jobQuery = '1'; state.filteredJobs = rows;", context);
   const html = context.usageView();
-  assert.match(html, /value="1" selected/); assert.match(html, /已删除/);
+  assert.match(html, /type="search"/); assert.match(html, /value="1"/); assert.doesNotMatch(html, /<select|<option/);
   assert.match(html, /&lt;同名&gt;/); assert.match(html, /sk-a…1/);
   assert.doesNotMatch(html, /<small|最近 100 条/);
   runInContext("modal = (title, html) => { globalThis.detailHTML = html; }; api = async () => ({ diagnostics: null });", context);
@@ -92,17 +108,19 @@ test('请求详情按需读取完整 Key，关闭或切换详情后丢弃迟到�
 
 test('快速切换 Key 时忽略迟到响应和错误，清除筛选后恢复全部记录', async () => {
   const context = ui(), pending = [];
-  context.request = path => new Promise((resolve, reject) => pending.push({ path, resolve, reject }));
-  runInContext("api = request; state.jobKey = '1';", context);
+  context.request = (path, options) => new Promise((resolve, reject) => pending.push({ path, options, resolve, reject }));
+  runInContext("api = request; state.jobQuery = '1';", context);
   const first = context.loadFilteredJobs();
-  runInContext("state.jobKey = '2';", context);
+  runInContext("state.jobQuery = '2';", context);
   const second = context.loadFilteredJobs();
   pending[1].resolve({ jobs: [job('second')] }); await second;
   pending[0].reject(new Error('过期错误')); await first;
   assert.equal(context.visibleJobs()[0].id, 'second');
   const third = context.loadFilteredJobs();
-  runInContext("state.jobKey = ''; state.data.jobs = [{ id: 'all' }]; jobSearchVersion++;", context);
+  runInContext("state.jobQuery = ''; state.data.jobs = [{ id: 'all' }]; jobSearchVersion++;", context);
   pending[2].resolve({ jobs: [job('stale')] }); await third;
   assert.equal(context.visibleJobs()[0].id, 'all');
-  assert.equal(pending[0].path, '/jobs?keyId=1');
+  assert.equal(pending[0].path, '/jobs/search');
+  assert.equal(pending[0].options.method, 'POST');
+  assert.equal(pending[0].options.body.query, '1');
 });
