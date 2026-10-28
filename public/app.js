@@ -399,7 +399,7 @@ async function detail(id) {
   modal(k.name, '<code id="new-token" class="token-display">'+e(token)+'</code><dl class="details">'+
     '<dt>等级</dt><dd>'+tierName(k.tier)+'</dd><dt>本地体力</dt><dd>'+staminaText(k)+'</dd>'+
     '<dt>有效期</dt><dd>'+e(expiresText(k.expires_at))+'</dd><dt>创建时间</dt><dd>'+date(k.created_at)+'</dd>'+
-    '<dt>当前余额</dt><dd>'+number(k.balance)+' Anlas</dd><dt>预留点数</dt><dd>'+number(k.reserved)+' Anlas</dd>'+
+    '<dt>当前余额</dt><dd>'+number(k.balance)+' Anlas</dd>'+
     '<dt>状态</dt><dd>'+keyStatus(k)+'</dd></dl><div class="modal-actions key-actions">'+
     '<button class="button subtle" data-action="edit-key" data-id="'+k.id+'">编辑 / 续期</button>'+
     '<button class="button '+(k.enabled ? 'danger' : 'subtle')+'" data-action="toggle-key" data-id="'+k.id+'">'+(k.enabled ? '停用密钥' : '启用密钥')+'</button>'+
