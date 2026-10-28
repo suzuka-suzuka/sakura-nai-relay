@@ -71,6 +71,9 @@ export class Store {
       suffix TEXT NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, retired_at INTEGER);
     `);
+    const upstreamColumns = this.db.prepare('PRAGMA table_info(upstreams)').all();
+    for (const name of ['note'])
+      if (!upstreamColumns.some(c => c.name === name)) this.db.exec(`ALTER TABLE upstreams ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`);
     if (this.db.prepare('PRAGMA table_info(upstreams)').all().some(c => c.name === 'weight')) this.transaction(() => {
       // Preserve accounts previously paused through weight=0 before removing the setting.
       this.db.exec('UPDATE upstreams SET enabled=0 WHERE weight=0; ALTER TABLE upstreams DROP COLUMN weight;');
@@ -130,28 +133,28 @@ export class Store {
     this.onChange?.(); return result;
   }
   upstreams() {
-    return this.db.prepare('SELECT id,name,suffix,enabled,created_at FROM upstreams WHERE retired_at IS NULL ORDER BY id').all();
+    return this.db.prepare('SELECT id,name,note,suffix,enabled,created_at FROM upstreams WHERE retired_at IS NULL ORDER BY id').all();
   }
   upstream(id) { return this.db.prepare('SELECT * FROM upstreams WHERE id=? AND retired_at IS NULL').get(id); }
   upstreamToken(id = this.upstreams()[0]?.id) { const row = this.upstream(id ?? -1); return row ? unseal(row.token, this.master) : null; }
-  addUpstream({ name, token, enabled = true }) {
+  addUpstream({ name, token, enabled = true, note = '' }) {
     const existing = this.db.prepare('SELECT id,retired_at FROM upstreams WHERE token_hash=?').get(hash(token));
     if (existing) assert(existing.retired_at, '这个上游 Key 已存在，请编辑原有记录', 409);
     name = this.recordName(name ?? '', 'upstreams');
     if (existing) {
-      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=? WHERE id=?').run(name, Number(enabled), existing.id);
+      this.db.prepare('UPDATE upstreams SET retired_at=NULL,name=?,enabled=?,note=? WHERE id=?').run(name, Number(enabled), note, existing.id);
       return existing.id;
     }
-    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,created_at) VALUES(?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Date.now());
+    const result = this.db.prepare('INSERT INTO upstreams(name,token,token_hash,suffix,enabled,created_at,note) VALUES(?,?,?,?,?,?,?)').run(name, seal(token, this.master), hash(token), token.slice(-4), Number(enabled), Date.now(), note);
     return Number(result.lastInsertRowid);
   }
-  updateUpstream(id, { name, token, enabled }) {
+  updateUpstream(id, { name, token, enabled, note }) {
     const previous = this.upstream(id); assert(previous, '上游不存在', 404);
     if (token) {
       assert(!this.db.prepare('SELECT id FROM upstreams WHERE token_hash=? AND id!=?').get(hash(token), id), '这个上游 Key 已存在', 409);
       this.db.prepare('UPDATE upstreams SET token=?,token_hash=?,suffix=? WHERE id=?').run(seal(token, this.master), hash(token), token.slice(-4), id);
     }
-    this.db.prepare('UPDATE upstreams SET name=?,enabled=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), id);
+    this.db.prepare('UPDATE upstreams SET name=?,enabled=?,note=? WHERE id=?').run(name === undefined ? previous.name : this.recordName(name, 'upstreams'), Number(enabled), note ?? previous.note, id);
   }
   retireUpstream(id) {
     return this.transaction(() => {

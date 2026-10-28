@@ -56,6 +56,21 @@ async function fixture(t) {
   return { app, mock, base, origin, call, key, stream, cookie, csrf, close };
 }
 
+test('上游 API 保存备注，启停保留元数据并拒绝无效输入', async t => {
+  const f = await fixture(t);
+  const created = await f.call('/admin/api/upstreams', 'POST', { token: 'pst-metadata-test', name: '账户测试', enabled: true, note: ' 首行\n次行 ' });
+  assert.equal(created.status, 201);
+  const { id } = await created.json();
+  assert.equal(f.app.store.upstream(id).note, '首行\n次行');
+  assert.equal((await f.call(`/admin/api/upstreams/${id}`, 'PUT', { enabled: false })).status, 200);
+  assert.equal(f.app.store.upstream(id).note, '首行\n次行');
+  for (const patch of [{ note: 42 }, { note: 'x'.repeat(1001) }]) {
+    assert.equal((await f.call(`/admin/api/upstreams/${id}`, 'PUT', { enabled: true, ...patch })).status, 400);
+  }
+  assert.equal((await f.call(`/admin/api/upstreams/${id}`, 'PUT', { enabled: true, note: '' })).status, 200);
+  assert.equal(f.app.store.upstream(id).note, '');
+});
+
 test('SSE 需要管理会话和同源来源，快照与额度均不泄露完整凭据', async t => {
   const f = await fixture(t);
   assert.equal((await fetch(f.base + '/admin/api/events')).status, 401);

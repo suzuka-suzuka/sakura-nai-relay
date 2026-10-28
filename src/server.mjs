@@ -153,6 +153,12 @@ export function createApp(config) {
         }
         const body = parse(await readBody(req, 16384));
         const name = optionalName(body.name === undefined ? previous?.name ?? '' : body.name);
+        const metadata = {};
+        for (const [field, label, limit] of [['note', '备注', 1000]]) {
+          if (body[field] === undefined) continue;
+          assert(typeof body[field] === 'string' && body[field].length <= limit, `${label}须为不超过 ${limit} 个字符的文本`);
+          metadata[field] = body[field].trim();
+        }
         assert(typeof body.enabled === 'boolean', '状态无效');
         const token = typeof body.token === 'string' ? body.token.trim() : '';
         assert(id !== null || token, '请填写官方 Key');
@@ -163,8 +169,8 @@ export function createApp(config) {
           assert(id === null || !router.busy.has(id) && !store.hasUnsettled(id), '该上游有请求正在执行，请稍后更换 Key', 409);
         }
         const savedId = store.transaction(() => {
-          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled });
-          store.updateUpstream(id, { name, token, enabled: body.enabled }); return id;
+          if (id === null) return store.addUpstream({ name, token, enabled: body.enabled, ...metadata });
+          store.updateUpstream(id, { name, token, enabled: body.enabled, ...metadata }); return id;
         });
         if (token) router.reset(savedId);
         return json(res, id === null ? 201 : 200, { id: savedId });

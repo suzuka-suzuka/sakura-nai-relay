@@ -19,7 +19,7 @@ const icons = {
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] ?? icons.grid}</svg>`;
 const flower = '<img src="/favicon.svg" alt="" class="flower">';
-const state = { csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', jobStatus: 'all', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
+const state = { upstreamSort: { key: 'id', direction: 'asc' }, csrf: null, view: 'overview', data: null, quota: null, quotaError: '', filter: '', keyMatches: null, keySearchError: '', logs: 'jobs', jobQuery: '', jobStatus: 'all', filteredJobs: null, jobError: '', cdks: null, cdkQuery: '', cdkHit: null };
 let jobSearchVersion = 0, jobSearchTimer, jobSearchComposing = false;
 const jobParameterSources = new WeakMap();
 let keySearchTimer, keySearchVersion = 0, cdkVersion = 0;
@@ -129,16 +129,41 @@ function upstreamBadge(row) {
   const [text, color] = !row.enabled ? ['已停用', 'muted'] : row.busy ? ['生成中', 'pink'] : row.cooldownUntil > Date.now() ? ['冷却中', 'amber'] : ['已启用', 'green'];
   return '<span class="badge '+color+'"><i></i>'+text+'</span>';
 }
-function upstreamCards() {
-  const rows = state.data.upstreams;
-  return rows.length ? rows.map(row => {
-    const q = quotaFor(row.id), pct = remaining(q);
-    return `<article class="upstream-card"><div class="upstream-card-head"><span class="upstream-mark">N</span><div class="upstream-card-name"><h3>${e(row.name)}</h3><code>•••• ${e(row.suffix)}</code></div>${upstreamBadge(row)}</div><div class="upstream-metrics"><div><span>账户余额</span><strong>${q?.ok ? number(q.account.relay.balance) : '—'}<small>Anlas</small></strong></div><div><span>排队请求</span><strong>${number(row.queued ?? 0)}</strong></div></div><div class="quota-row"><span>NAI5 剩余额度</span><b>${pct === null ? '—' : pct.toFixed(1) + '%'}</b></div><div class="progress-track"><div style="width:${pct ?? 0}%"></div></div>${row.error || q && !q.ok ? '<p class="field-note">'+e(row.error || q.error)+'</p>' : ''}<p class="field-note">${q?.ok ? e(({0:"无订阅",1:"Tablet",2:"Scroll",3:"Opus"})[q.account.tier] ?? "其他套餐") : "套餐待查询"}${q?.ok && q.account.expiresAt ? " · 到期 " + e(expiresText(q.account.expiresAt * 1000)) : ""}</p><div class="upstream-card-actions"><button class="button small subtle" data-action="edit-upstream" data-id="${row.id}">编辑上游</button><button class="button small text-button" data-action="toggle-upstream" data-id="${row.id}">${row.enabled ? '停用' : '启用'}</button></div></article>`;
-  }).join('') : empty('暂无上游', '', '<button class="button subtle" data-action="add-upstream">添加上游</button>');
+function upstreamSortValue(row, key) {
+  const q = quotaFor(row.id);
+  if (key === 'expires') return q?.ok && q.account.expiresAt ? q.account.expiresAt : null;
+  if (key === 'points') return q?.ok ? q.account.relay.balance : null;
+  if (key === 'stamina') return q?.ok ? remaining(q) : null;
+  return row[key] ?? null;
+}
+function sortedUpstreams() {
+  const { key, direction } = state.upstreamSort;
+  return [...state.data.upstreams].sort((a, b) => {
+    if (!!a.enabled !== !!b.enabled) return a.enabled ? -1 : 1;
+    const x = upstreamSortValue(a, key), y = upstreamSortValue(b, key);
+    if (x === null || y === null) return x === y ? a.id - b.id : x === null ? 1 : -1;
+    const comparison = typeof x === 'string' ? x.localeCompare(y, 'zh-CN', { numeric: true }) : x - y;
+    return (direction === 'asc' ? comparison : -comparison) || a.id - b.id;
+  });
+}
+function upstreamTable() {
+  const rows = sortedUpstreams();
+  if (!rows.length) return empty('暂无上游', '', '<button class="button subtle" data-action="add-upstream">添加上游</button>');
+  const heading = (key, label) => {
+    const active = state.upstreamSort.key === key, ascending = state.upstreamSort.direction === 'asc';
+    return `<th aria-sort="${active ? ascending ? 'ascending' : 'descending' : 'none'}"><button class="sort-button" data-action="sort-upstreams" data-sort="${key}">${label}<span aria-hidden="true">${active ? ascending ? '↑' : '↓' : '↕'}</span></button></th>`;
+  };
+  return `<div class="table-scroll"><table class="upstream-table"><thead><tr><th aria-sort="${state.upstreamSort.key === 'id' ? 'other' : 'none'}"><button class="sort-button" data-action="sort-upstreams" data-sort="id" title="恢复默认排序">上游名称</button></th><th>状态 / 套餐</th>${heading('expires', '过期时间')}${heading('points', '点数 · Anlas')}${heading('stamina', '体力 · NAI5')}<th>排队</th><th>备注</th><th>操作</th></tr></thead><tbody>${rows.map((row, index) => {
+    const groupStart = index === 0 || !!rows[index - 1].enabled !== !!row.enabled;
+    const group = groupStart ? `<tr class="upstream-group${row.enabled ? '' : ' upstream-group-disabled'}"><th colspan="8" scope="rowgroup">${row.enabled ? '已启用' : '已停用'}<span class="count">${rows.filter(item => !!item.enabled === !!row.enabled).length}</span></th></tr>` : '';
+    const q = quotaFor(row.id), pct = q?.ok ? remaining(q) : null;
+    const error = row.error || (q && !q.ok ? q.error : '');
+    return `${group}<tr><td><strong>${e(row.name)}</strong><code class="cell-note">•••• ${e(row.suffix)}</code></td><td>${upstreamBadge(row)}<span class="cell-note">${q?.ok ? e(({0:'无订阅',1:'Tablet',2:'Scroll',3:'Opus'})[q.account.tier] ?? '其他套餐') : '套餐待查询'}</span>${error ? `<span class="cell-note">${e(error)}</span>` : ''}</td><td class="upstream-expiry">${q?.ok && q.account.expiresAt ? e(expiresText(q.account.expiresAt * 1000)) : '—'}</td><td><strong class="point-value">${q?.ok ? number(q.account.relay.balance) : '—'}</strong></td><td><div class="upstream-stamina"><span>${pct === null ? '—' : pct.toFixed(1) + '%'}</span><div class="progress-track"><div style="width:${pct ?? 0}%"></div></div></div></td><td>${number(row.queued ?? 0)}</td><td class="upstream-note">${e(row.note || '—')}</td><td><div class="upstream-actions"><button class="button small subtle" data-action="edit-upstream" data-id="${row.id}">编辑</button><button class="button small text-button" data-action="toggle-upstream" data-id="${row.id}">${row.enabled ? '停用' : '启用'}</button></div></td></tr>`;
+  }).join('')}</tbody></table></div>`;
 }
 function editUpstream(id) {
   const row = state.data.upstreams.find(u => u.id === Number(id));
-  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" maxlength="64" autofocus></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
+  modal(row ? '编辑上游' : '添加上游', `<form id="upstream-form" data-id="${row?.id ?? ''}"><label>上游名称<input name="name" value="${e(row?.name ?? '')}" maxlength="64" placeholder="填写账户邮箱或名称" autofocus></label><label>备注（可选）<textarea name="note" rows="3" maxlength="1000" placeholder="填写账户备注">${e(row?.note ?? '')}</textarea></label><label>NovelAI 官方 Key<input name="token" type="password" autocomplete="new-password" maxlength="4096" placeholder="${row ? '留空保留已保存的 Key · 尾号 ' + e(row.suffix) : 'pst-…'}" ${row ? '' : 'required'}></label><div class="toggle-row"><div><strong>启用上游</strong></div><label class="switch"><input name="enabled" type="checkbox" ${!row || row.enabled ? 'checked' : ''} aria-label="启用上游"><span></span></label></div><div class="form-error" role="alert"></div><div class="modal-actions">${row ? '<button class="button danger" type="button" data-action="remove-upstream" data-id="'+row.id+'">移除</button>' : ''}<button class="button subtle" type="button" data-action="close">取消</button><button class="button primary" type="submit">${row ? '保存修改' : '添加上游'}</button></div></form>`);
 }
 function usageChart(days, metric, title, unit) {
   const max = Math.max(1, ...days.map(day => day[metric] ?? 0));
@@ -265,7 +290,7 @@ function usageView() {
 }
 function settingsView() {
   const s = state.data.settings, rows = state.data.upstreams;
-  return `<section class="pool-section"><div class="pool-heading"><h2>上游账户 <span class="count">${rows.length}</span></h2><button class="button primary" data-action="add-upstream">${icon('plus')}添加上游</button></div><div id="upstream-cards" class="upstream-cards">${upstreamCards()}</div></section><form class="panel settings-form" id="settings-form"><div class="panel-title"><h2>访问设置</h2><button class="button small subtle" type="button" data-action="password">修改密码</button></div><div class="access-fields"><div><label>允许的来源<textarea name="origins" rows="3" placeholder="* 或 https://example.com">${e(s.origins.join('\n'))}</textarea></label><p class="field-note">填写 * 允许所有来源；指定站点时每行一个，包含协议和端口，不含路径。访问仍需中转 Key。</p></div><div><label id="relay-address-label">中转地址</label><div class="address-field" aria-labelledby="relay-address-label"><code>${e(state.data.relayUrl)}</code><button class="icon-button" type="button" data-action="copy-url" aria-label="复制中转地址">${icon('copy')}</button></div><div class="toggle-row"><strong>开放中转</strong><label class="switch"><input name="enabled" type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="开放中转"><span></span></label></div></div></div><div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>`;
+  return `<section class="pool-section"><div class="pool-heading"><h2>上游账户 <span class="count">${rows.length}</span></h2><button class="button primary" data-action="add-upstream">${icon('plus')}添加上游</button></div><div id="upstream-list" class="panel upstream-list">${upstreamTable()}</div></section><form class="panel settings-form" id="settings-form"><div class="panel-title"><h2>访问设置</h2><button class="button small subtle" type="button" data-action="password">修改密码</button></div><div class="access-fields"><div><label>允许的来源<textarea name="origins" rows="3" placeholder="* 或 https://example.com">${e(s.origins.join('\n'))}</textarea></label><p class="field-note">填写 * 允许所有来源；指定站点时每行一个，包含协议和端口，不含路径。访问仍需中转 Key。</p></div><div><label id="relay-address-label">中转地址</label><div class="address-field" aria-labelledby="relay-address-label"><code>${e(state.data.relayUrl)}</code><button class="icon-button" type="button" data-action="copy-url" aria-label="复制中转地址">${icon('copy')}</button></div><div class="toggle-row"><strong>开放中转</strong><label class="switch"><input name="enabled" type="checkbox" ${s.enabled ? 'checked' : ''} aria-label="开放中转"><span></span></label></div></div></div><div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>`;
 }
 const cdkSpec = product => `${product.tier === 'member' ? '会员' : '普通'} · ${product.validDays} 天 · ${number(product.points)} 点${product.tier === 'member' ? product.staminaPercent === 0 ? ' · 无 V5 体力' : ` · 体力 ${product.staminaPercent}%` : ''}`;
 function cdksView() {
@@ -315,7 +340,7 @@ function updateQuota(data) {
   if (state.quota && state.quota.fetchedAt > data.fetchedAt) return;
   state.quota = data; state.quotaError = '';
   const comparison = $('.quota-comparison-grid'); if (comparison) comparison.outerHTML = quotaComparison();
-  const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
+  const cards = $('#upstream-list'); if (cards) cards.innerHTML = upstreamTable();
 }
 function applySnapshot(data) {
   const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
@@ -384,7 +409,7 @@ async function quota() {
   state.quotaError = '';
   try { updateQuota(await api('/quota')); } catch (error) { state.quotaError = error.message; }
   // Preserve unsaved settings inputs when refreshing quota.
-  const cards = $('#upstream-cards'); if (cards) cards.innerHTML = upstreamCards();
+  const cards = $('#upstream-list'); if (cards) cards.innerHTML = upstreamTable();
 }
 function createKey() {
   keyForm();
@@ -469,6 +494,16 @@ async function revealJobKey(id) {
 document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]'); if (!button) return;
   const { action, id } = button.dataset;
+  if (action === 'sort-upstreams') {
+    const key = button.dataset.sort;
+    const direction = key === 'id' ? 'asc' : state.upstreamSort.key === key
+      ? state.upstreamSort.direction === 'asc' ? 'desc' : 'asc'
+      : ['points', 'stamina'].includes(key) ? 'desc' : 'asc';
+    state.upstreamSort = { key, direction };
+    $('#upstream-list').innerHTML = upstreamTable();
+    $(`[data-sort="${key}"]`)?.focus({ preventScroll: true });
+    return;
+  }
   if (action === 'close') return closeModal();
   if (action === 'job-parameters') return openJobParameters(button);
   if (action === 'close-job-parameters') return closeJobParameters();
@@ -555,7 +590,7 @@ document.addEventListener('submit', async event => {
         modal('密钥已创建', `<div class="success-mark">${icon('check')}</div><code id="new-token" class="token-display">${e(result.token)}</code><div class="key-connect"><span>连接地址</span><code>${e(state.data.relayUrl)}</code></div><div class="modal-actions"><button class="button subtle" data-action="close">关闭</button><button class="button primary" data-action="copy-key">${icon('copy')}复制密钥</button></div>`);
       }
       if (form.id === 'points-form') { await api(`/keys/${form.dataset.id}/points`, { method: 'POST', body: { delta: Number(values.delta), note: values.note } }); closeModal(); await refresh(); toast('Anlas 已调整，流水已记录'); }
-      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); toast('上游已保存'); }
+      if (form.id === 'upstream-form') { await api('/upstreams'+(form.dataset.id ? '/'+form.dataset.id : ''), {method:form.dataset.id ? 'PUT' : 'POST', body:{name:values.name, note:values.note, token:values.token.trim(), enabled:values.enabled === 'on'}}); closeModal(); await refresh(); toast('上游已保存'); }
       if (form.id === 'settings-form') {
         await api('/settings', { method: 'PUT', body: { enabled: values.enabled === 'on', origins: values.origins.split('\n').map(x => x.trim()).filter(Boolean) } }); settingsDirty = false; await refresh(); toast('设置已保存');
       }
