@@ -185,13 +185,13 @@ function quotaComparison() {
 }
 function overview() {
   const d = state.data;
-  const cards = [['访问密钥', number(d.keys.length), `${d.keys.filter(k => k.enabled && !expired(k)).length} 个启用中`, 'key'], ['上游密钥', number(d.upstreams.length), '', 'shield'], ['累计消耗', number(d.stats.spent), '', 'activity'], ['请求总数', number(d.stats.requests), '', 'clock']];
+  const cards = [['访问密钥', number(d.keys.filter(k => k.enabled && !expired(k)).length), 'key'], ['上游密钥', number(d.upstreams.filter(u => u.enabled).length), 'shield'], ['今日活跃', number(d.stats.activeToday), 'activity'], ['正在生成', number(d.stats.generating), 'clock']];
   const now = Date.now();
   const days = Array.from({ length: 7 }, (_, i) => {
     const day = new Date(now - (6 - i) * 86400000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     return { ...d.trend.find(item => item.day === day), label: Number(day.slice(5, 7)) + '/' + Number(day.slice(8, 10)) };
   });
-  return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,hint,symbol], i) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}${i === 2 ? '<small>Anlas</small>' : ''}</strong>${hint ? `<p>${hint}</p>` : ""}</article>`).join('')}</div>${quotaComparison()}<div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div>`;
+  return `${!d.settings.configured ? `<div class="onboarding"><span class="onboarding-icon">${icon('settings')}</span><div><strong>尚未配置上游</strong></div><a href="#settings" class="button text-button">添加上游 ${icon('arrow')}</a></div>` : ''}<div class="stats-grid">${cards.map(([name,value,symbol]) => `<article class="stat-card"><div>${name}<span>${icon(symbol)}</span></div><strong>${value}</strong></article>`).join('')}</div>${quotaComparison()}<div class="usage-grid">${usageComparison(days)}${usageChart(days, "requests", "最近 7 天请求次数", "次")}</div>`;
 }
 function keyTable(keys) {
   if (state.view === 'keys' && state.filter.trim()) {

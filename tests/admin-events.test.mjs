@@ -89,6 +89,39 @@ test('两条 SSE 连接同步收到余额、流水、兑换库存与兑换记录
   assert.equal(latest.keys.length, 2); assert.equal(latest.ledger.find(row => row.kind === 'adjust').delta, 5);
 });
 
+test('概览活跃数按北京时间去重且不受最近百条记录限制，跨日生成仍计运行数', async t => {
+  let now = Date.parse('2026-10-27T23:59:59+08:00');
+  t.mock.method(Date, 'now', () => now);
+  const f = await fixture(t), start = Date.parse('2026-10-27T00:00:00+08:00');
+  const other = f.app.store.createKey('另一位用户', 100);
+  const insert = f.app.store.db.prepare(`INSERT INTO jobs
+    (id,key_id,endpoint,status,reserved,created_at,upstream_id,upstream_name,tier_snapshot,route_mode,upstream_estimate)
+    VALUES(?,?,?,?,0,?,?,'Mock','standard','pool',0)`);
+  let sequence = 0;
+  const job = (keyId, at, status = 'completed', endpoint = '/ai/generate-image', upstreamId = 1) =>
+    insert.run(String(++sequence), keyId, endpoint, status, at, upstreamId);
+  const read = async () => (await (await f.call('/admin/api/snapshot')).json());
+  assert.equal((await read()).stats.activeToday, 0);
+  job(other.id, start - 1, 'running'); // Yesterday's generation can still be in flight.
+  job(other.id, start, 'failed', '/ai/generate-image', null); // Rejected before upstream execution.
+  job(other.id, start, 'pending');
+  job(other.id, start, 'running', '/ai/encode-vibe');
+  job(null, start, 'failed', '/ai/generate-image', null);
+  job(f.key.id, start); // Exactly midnight belongs to today.
+  for (let i = 0; i < 105; i++) job(f.key.id, start + 1000, 'failed');
+  let data = await read();
+  assert.equal(data.jobs.length, 100);
+  assert.equal(data.stats.activeToday, 1); assert.equal(data.stats.generating, 1);
+  job(other.id, start + 2000, 'running', '/ai/generate-image-stream');
+  job(f.key.id, start + 3000, 'running', '/ai/augment-image');
+  job(f.key.id, start + 4000, 'running', '/ai/upscale');
+  data = await read();
+  assert.equal(data.stats.activeToday, 2); assert.equal(data.stats.generating, 4);
+  now = Date.parse('2026-10-28T00:00:00+08:00');
+  data = await read();
+  assert.equal(data.stats.activeToday, 0); assert.equal(data.stats.generating, 4);
+});
+
 test('真实生成执行中及结算后推送状态、扣点、上游忙闲和额度', async t => {
   const f = await fixture(t), stream = await f.stream();
   await stream.next('snapshot'); await stream.next('quota'); f.mock.state.slow = 200;
@@ -102,6 +135,7 @@ test('真实生成执行中及结算后推送状态、扣点、上游忙闲和�
   f.app.store.adjust(f.key.id, 1, '触发独立快照');
   const waiting = await stream.next('snapshot', data => data.keys[0].balance === 101);
   assert.deepEqual(waiting.jobs, []); assert.equal(waiting.stats.requests, 0); assert.deepEqual(waiting.trend, []);
+  assert.equal(waiting.stats.activeToday, 0); assert.equal(waiting.stats.generating, 0);
   const reconnected = await f.stream(); assert.deepEqual((await reconnected.next('snapshot')).jobs, []);
   assert.deepEqual((await (await f.call('/admin/api/jobs')).json()).jobs, []);
   assert.deepEqual((await (await f.call('/admin/api/jobs/search', 'POST', { query: f.key.token, status: 'all' })).json()).jobs, []);
@@ -110,11 +144,13 @@ test('真实生成执行中及结算后推送状态、扣点、上游忙闲和�
   const running = await stream.next('snapshot', data => data.jobs.length > 0);
   assert.equal(running.jobs[0].status, 'running'); assert.equal(running.jobs[0].upstream_id, 1);
   assert.equal(running.jobs[0].upstream_name, 'Mock');
+  assert.equal(running.stats.activeToday, 1); assert.equal(running.stats.generating, 1);
   assert.equal(running.busy, true); assert.equal(running.keys[0].reserved, 26);
   const response = await pending; assert.equal(response.status, 200); await response.arrayBuffer();
   const completed = await stream.next('snapshot', data => data.jobs[0]?.status === 'completed' && !data.busy);
   assert.equal(completed.keys[0].balance, 75); assert.equal(completed.keys[0].reserved, 0);
   assert.equal(completed.stats.spent, 26); assert.equal(completed.ledger[0].kind, 'usage');
+  assert.equal(completed.stats.activeToday, 1); assert.equal(completed.stats.generating, 0);
   const quota = await stream.next('quota', data => data.totalAnlas === 9974);
   assert.equal(quota.failed, 0);
 });
