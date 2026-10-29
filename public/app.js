@@ -185,7 +185,7 @@ function quotaTotals(data, quota, now = Date.now()) {
   const keys = data.keys.filter(key => key.enabled && (key.expires_at === null || key.expires_at > now));
   const totals = {
     stamina: { available: 0, issued: keys.reduce((sum, key) => sum + (key.tier === 'member' ? Math.max(0, key.stamina_balance - key.stamina_reserved) : 0), 0) / 1120 },
-    anlas: { available: 0, issued: keys.reduce((sum, key) => sum + Math.max(0, key.balance - key.reserved), 0) },
+    anlas: { available: 0, issued: keys.reduce((sum, key) => sum + (key.tier === 'member' ? Math.max(0, key.balance - key.reserved) : 0), 0) },
   };
   for (const row of data.upstreams.filter(row => row.enabled)) {
     const result = quota?.upstreams.find(item => item.id === row.id);

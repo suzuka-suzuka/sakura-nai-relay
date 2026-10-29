@@ -10,9 +10,9 @@ const totals = (data, quota) => JSON.parse(JSON.stringify(context.quotaTotals(da
 const key = (patch = {}) => ({ enabled: true, expires_at: null, tier: 'member', balance: 2000, reserved: 100, stamina_balance: 56000, stamina_reserved: 1120, ...patch });
 const upstream = (id, patch = {}) => ({ id, ok: true, account: { tier: 3, active: true, usage: { percent: 80, isNegative: false }, relay: { available: 5000 }, ...patch } });
 
-test('compares outstanding usable balances, excluding disabled/expired keys and disabled upstreams', () => {
+test('compares member usable balances, excluding standard/disabled/expired keys and disabled upstreams', () => {
   const result = totals({ keys: [key(), key({ tier: 'standard' }), key({ enabled: false }), key({ expires_at: 10000 })], upstreams: [{ id: 1, enabled: true }, { id: 2, enabled: true }, { id: 3, enabled: false }] }, { upstreams: [upstream(1), upstream(2), upstream(3)] });
-  assert.deepEqual(result, { stamina: { available: 160, issued: 49 }, anlas: { available: 10000, issued: 3800 } });
+  assert.deepEqual(result, { stamina: { available: 160, issued: 49 }, anlas: { available: 10000, issued: 1900 } });
 });
 
 test('expired and non-Opus accounts contribute points but no V5 stamina; negative usage is zero', () => {
