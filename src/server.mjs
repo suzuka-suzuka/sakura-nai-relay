@@ -131,7 +131,7 @@ export function createApp(config) {
     if (path === '/admin/api/events' && req.method === 'GET') {
       assert(!req.headers.origin || req.headers.origin === config.publicOrigin, '请求来源不匹配', 403);
       assert(!req.headers['sec-fetch-site'] || req.headers['sec-fetch-site'] === 'same-origin', '请求来源不匹配', 403);
-      return events.connect(req, res, s);
+      return events.connect(req, res, s, { delta: new URL(req.url, config.publicOrigin).searchParams.get('delta') === '1' });
     }
     if (path === '/admin/api/quota' && req.method === 'GET') {
       allow('admin-quota', 20);

@@ -1,4 +1,24 @@
-// One shared publisher per process; backpressure retains only the latest event of each kind.
+const ROW_COLLECTIONS = new Set(['keys', 'upstreams', 'jobs', 'ledger']);
+
+// Rows are replaced by ID; unchanged collections do not travel over the wire.
+export function snapshotPatch(previous, next) {
+  const values = {}, collections = {};
+  for (const [field, value] of Object.entries(next)) {
+    if (JSON.stringify(previous[field]) === JSON.stringify(value)) continue;
+    if (!ROW_COLLECTIONS.has(field)) { values[field] = value; continue; }
+    const before = previous[field] ?? [], old = new Map(before.map(row => [row.id, JSON.stringify(row)]));
+    const ids = value.map(row => row.id), keep = new Set(ids);
+    const change = {
+      upsert: value.filter(row => old.get(row.id) !== JSON.stringify(row)),
+      remove: before.filter(row => !keep.has(row.id)).map(row => row.id),
+    };
+    if (JSON.stringify(before.map(row => row.id)) !== JSON.stringify(ids)) change.order = ids;
+    collections[field] = change;
+  }
+  return Object.keys(values).length || Object.keys(collections).length ? { values, collections } : null;
+}
+
+// Backpressure retains latest target snapshots, never drops an intermediate delta.
 export function adminEvents({ snapshot, session, quota }) {
   const clients = new Map();
   let updateTimer, heartbeat, quotaTimer, quotaPending = null, quotaAgain = false, closed = false, latestQuota = null;
@@ -7,7 +27,25 @@ export function adminEvents({ snapshot, session, quota }) {
     const client = clients.get(res);
     if (!client) return;
     if (client.blocked) { client.pending.set(event, data); return; }
-    if (!res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)) {
+    let payload = data, kind = event;
+    if (event === 'snapshot') {
+      if (client.snapshot) {
+        if (client.delta) {
+          payload = snapshotPatch(client.snapshot, data);
+          if (!payload) return;
+          kind = 'patch';
+        } else if (JSON.stringify(client.snapshot) === JSON.stringify(data)) return;
+      }
+      // res.write accepts the frame even when it returns false. Advance only here,
+      // so the next delta is based on data actually queued for this connection.
+      client.snapshot = data;
+    } else if (event === 'quota') {
+      const { fetchedAt, ...content } = data;
+      const encoded = JSON.stringify(content);
+      if (client.quota === encoded) return;
+      client.quota = encoded;
+    }
+    if (!res.write(`event: ${kind}\ndata: ${JSON.stringify(payload)}\n\n`)) {
       client.blocked = true;
       client.slowTimer = setTimeout(() => res.destroy(), 30000);
       res.once('drain', () => {
@@ -32,15 +70,13 @@ export function adminEvents({ snapshot, session, quota }) {
     clearTimeout(updateTimer);
     updateTimer = null;
     if (closed || !clients.size) return;
-    const data = snapshot(), encoded = JSON.stringify(data);
+    const data = snapshot();
     for (const [res, client] of clients) {
-      if (valid(res, client) && client.snapshot !== encoded) {
-        client.snapshot = encoded; write(res, 'snapshot', data);
-      }
+      if (valid(res, client)) write(res, 'snapshot', data);
     }
   }
   function changed() {
-    if (!closed && clients.size && !updateTimer) updateTimer = setTimeout(publish, 50);
+    if (!closed && clients.size && !updateTimer) updateTimer = setTimeout(publish, 500);
   }
   async function refreshQuota() {
     if (closed || !clients.size) return;
@@ -60,12 +96,12 @@ export function adminEvents({ snapshot, session, quota }) {
   return {
     changed, refreshQuota,
     revalidate() { for (const [res, client] of clients) valid(res, client); },
-    connect(req, res, adminSession) {
+    connect(req, res, adminSession, { delta = false } = {}) {
       if (closed) { res.writeHead(503); res.end(); return; }
       const data = snapshot();
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no' });
       res.flushHeaders(); res.write('retry: 3000\n\n');
-      const client = { req, snapshot: JSON.stringify(data), pending: new Map(), blocked: false };
+      const client = { req, delta, snapshot: null, pending: new Map(), blocked: false };
       clients.set(res, client);
       res.once('close', () => remove(res));
       client.expiryTimer = setTimeout(() => valid(res, client), Math.max(1, adminSession.expires - Date.now()));

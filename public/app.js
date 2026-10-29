@@ -269,7 +269,7 @@ async function loadFilteredJobs() {
   const version = ++jobSearchVersion, query = state.jobQuery.trim(), status = state.jobStatus;
   if (!state.data || jobSearchComposing) return;
   try {
-    const result = await api('/jobs/search', { method: 'POST', body: { query, status } });
+    const result = !query && status === 'all' ? { jobs: state.data.jobs } : await api('/jobs/search', { method: 'POST', body: { query, status } });
     if (version !== jobSearchVersion || query !== state.jobQuery.trim() || status !== state.jobStatus || !state.data) return;
     state.filteredJobs = result.jobs; state.jobError = '';
   } catch (error) {
@@ -342,10 +342,20 @@ function updateQuota(data) {
   const comparison = $('.quota-comparison-grid'); if (comparison) comparison.outerHTML = quotaComparison();
   const cards = $('#upstream-list'); if (cards) cards.innerHTML = upstreamTable();
 }
+function mergeSnapshotPatch(previous, patch) {
+  const next = { ...previous, ...patch.values };
+  for (const [field, change] of Object.entries(patch.collections)) {
+    const rows = new Map(previous[field].map(row => [row.id, row]));
+    for (const id of change.remove) rows.delete(id);
+    for (const row of change.upsert) rows.set(row.id, row);
+    next[field] = change.order ? change.order.map(id => rows.get(id)) : [...rows.values()];
+  }
+  return next;
+}
 function applySnapshot(data) {
   const previous = state.data; state.data = data; state.cdks = data.cdks; snapshotVersion++; cdkVersion++;
   if (!previous) { settingsDirty = false; shell(); return; }
-  if (state.view === 'usage' && state.logs === 'jobs') void loadFilteredJobs();
+  if (state.view === 'usage' && state.logs === 'jobs' && (previous.jobs !== data.jobs || previous.keys !== data.keys)) void loadFilteredJobs();
   const count = $('.nav-item[href="#keys"] small'); if (count) count.textContent = data.keys.length;
   const connection = $('.connection-state');
   if (connection) {
@@ -376,8 +386,13 @@ function applySnapshot(data) {
 }
 function startEvents() {
   if (liveEvents || !state.data || !state.csrf) return;
-  const source = liveEvents = new EventSource('/admin/api/events');
-  source.addEventListener('snapshot', event => { if (liveEvents === source) applySnapshot(JSON.parse(event.data)); });
+  const source = liveEvents = new EventSource('/admin/api/events?delta=1');
+  // Keep the stream baseline separate from one-off HTTP refreshes.
+  let baseline = null;
+  source.addEventListener('snapshot', event => { if (liveEvents === source) applySnapshot(baseline = JSON.parse(event.data)); });
+  source.addEventListener('patch', event => {
+    if (liveEvents === source && baseline) applySnapshot(baseline = mergeSnapshotPatch(baseline, JSON.parse(event.data)));
+  });
   source.addEventListener('quota', event => { if (liveEvents === source) updateQuota(JSON.parse(event.data)); });
   source.addEventListener('session-expired', () => {
     if (liveEvents !== source) return;

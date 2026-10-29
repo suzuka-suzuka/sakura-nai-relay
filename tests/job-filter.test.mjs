@@ -163,12 +163,14 @@ test('快速切换 Key 时忽略迟到响应和错误，清除 Key 后恢复全�
   pending[0].reject(new Error('过期错误')); await first;
   assert.equal(context.visibleJobs()[0].id, 'second');
   const third = context.loadFilteredJobs();
+  context.recent = [job('success-without-key')];
+  runInContext('state.data.jobs = recent;', context);
   context.updateJobSearch('');
   const fourth = context.loadFilteredJobs();
-  pending[3].resolve({ jobs: [job('success-without-key')] }); await fourth;
+  await fourth;
   pending[2].resolve({ jobs: [job('stale')] }); await third;
   assert.equal(context.visibleJobs()[0].id, 'success-without-key');
-  assert.equal(pending[3].options.body.query, ''); assert.equal(pending[3].options.body.status, 'all');
+  assert.equal(pending.length, 3); // Clearing the filter reuses the current snapshot.
   assert.equal(pending[0].path, '/jobs/search');
   assert.equal(pending[0].options.method, 'POST');
   assert.equal(pending[0].options.body.query, '1');
@@ -202,9 +204,10 @@ test('状态筛选可单独使用或组合 Key，切换后忽略旧响应，实�
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(context.visibleJobs()[0].id, 'live-cancelled');
   runInContext("state.jobStatus = 'all';", context); context.updateJobSearch('');
+  context.recent = [{ ...job('running'), status: 'running', upstream_name: '上游 1' }, job('new-success')];
+  runInContext('state.data.jobs = recent;', context);
   const success = context.loadFilteredJobs();
-  assert.equal(pending[4].options.body.status, 'all');
-  pending[4].resolve({ jobs: [{ ...job('running'), status: 'running', upstream_name: '上游 1' }, job('new-success')] }); await success;
+  await success; assert.equal(pending.length, 4);
   assert.equal(context.visibleJobs()[0].id, 'running');
   assert.match(context.jobTable(), /处理中/);
 });

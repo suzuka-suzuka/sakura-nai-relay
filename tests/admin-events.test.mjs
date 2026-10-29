@@ -22,8 +22,8 @@ async function fixture(t) {
   const response = await call('/admin/api/upstreams', 'POST', { token: 'pst-local-test', name: 'Mock', enabled: true });
   assert.equal(response.status, 201);
   const key = await (await call('/admin/api/keys', 'POST', { name: '实时测试', points: 100 })).json();
-  async function stream(headers = {}) {
-    const response = await call('/admin/api/events', 'GET', undefined, headers);
+  async function stream(headers = {}, delta = false) {
+    const response = await call('/admin/api/events' + (delta ? '?delta=1' : ''), 'GET', undefined, headers);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /text\/event-stream/);
     assert.equal(response.headers.get('x-accel-buffering'), 'no');
@@ -84,6 +84,22 @@ test('SSE 需要管理会话和同源来源，快照与额度均不泄露完整�
   }
 });
 
+test('增量接口首次发送完整快照，调整余额只发送变化记录，重连恢复全量', async t => {
+  const f = await fixture(t), a = await f.stream({}, true), b = await f.stream({}, true);
+  await a.next('snapshot'); await b.next('snapshot');
+  await f.call(`/admin/api/keys/${f.key.id}/points`, 'POST', { delta: 5 });
+  for (const stream of [a, b]) {
+    const patch = await stream.next('patch');
+    assert.equal(patch.collections.keys.upsert[0].balance, 105);
+    assert.equal(patch.collections.ledger.upsert[0].delta, 5);
+    assert.equal(patch.collections.jobs, undefined);
+    for (const secret of [f.key.token, 'pst-local-test', f.csrf]) assert.ok(!JSON.stringify(patch).includes(secret));
+  }
+  await a.reader.cancel();
+  const fresh = await f.stream({}, true);
+  assert.equal((await fresh.next('snapshot')).keys[0].balance, 105);
+});
+
 test('两条 SSE 连接同步收到余额、流水、兑换库存与兑换记录；重连取得最新快照', async t => {
   const f = await fixture(t), a = await f.stream(), b = await f.stream();
   await a.next('snapshot'); await b.next('snapshot');
@@ -139,7 +155,7 @@ test('概览活跃数按北京时间去重且不受最近百条记录限制，�
 
 test('真实生成执行中及结算后推送状态、扣点、上游忙闲和额度', async t => {
   const f = await fixture(t), stream = await f.stream();
-  await stream.next('snapshot'); await stream.next('quota'); f.mock.state.slow = 200;
+  await stream.next('snapshot'); await stream.next('quota'); f.mock.state.slow = 800;
   const unlock = await f.app.router.lockKey(f.key.id); t.after(unlock);
   const pending = fetch(f.base + '/ai/generate-image', {
     method: 'POST', headers: { Authorization: `Bearer ${f.key.token}`, 'Content-Type': 'application/json' },
