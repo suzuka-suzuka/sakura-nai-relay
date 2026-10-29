@@ -29,7 +29,9 @@ export function estimateCost(s, account, uncachedVibes = 0) {
   const area = billed.width * billed.height, free = opus && allowance && area <= 1048576 && s.steps <= 28;
   const smea = !s.imageSource && !v5 && !isV4(s.model) && s.autoSmea;
   const strength = s.imageSource ? s.imageSource.mode === 'infill' ? s.imageSource.inpaintStrength : s.imageSource.strength : 1;
-  const perImage = Math.max(2, Math.ceil(Math.ceil(2.951823174884865e-6 * area + 5.753298233447344e-7 * area * s.steps) * (smea ? 1.2 : 1) * (v5 ? 1.5 : 1) * strength));
+  // NovelAI's Medium discount applies only to the step term, before base rounding.
+  const stepFactor = s.model === 'nai-diffusion-5-full-medium' ? 1 / 1.06521739 : 1;
+  const perImage = Math.max(2, Math.ceil(Math.ceil(2.951823174884865e-6 * area + 5.753298233447344e-7 * area * s.steps * stepFactor) * (smea ? 1.2 : 1) * (v5 ? 1.5 : 1) * strength));
   const base = perImage * Math.max(0, s.nSamples - (free ? 1 : 0));
   const refsAllowed = !v5 && s.imageSource?.mode !== 'infill';
   const director = refsAllowed && ['nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated'].includes(s.model) ? s.directorReference.length : 0;

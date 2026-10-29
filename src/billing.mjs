@@ -2,7 +2,7 @@ import { assert, integer } from './security.mjs';
 import { estimateCost, augmentCost, upscaleCost, active } from './cost.mjs';
 import { localUsage, hasLocalStamina, IMAGE_STAMINA, dailyFor, availableStamina, staminaPercent } from './stamina.mjs';
 
-const models = new Set(['nai-diffusion-3', 'nai-diffusion-furry-3', 'nai-diffusion-4-full', 'nai-diffusion-4-curated-preview', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated', 'nai-diffusion-5-full', 'nai-diffusion-5-curated']);
+const models = new Set(['nai-diffusion-3', 'nai-diffusion-furry-3', 'nai-diffusion-4-full', 'nai-diffusion-4-curated-preview', 'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated', 'nai-diffusion-5-full', 'nai-diffusion-5-full-medium', 'nai-diffusion-5-curated']);
 export function balanceOf(subscription) {
   const fixed = subscription?.trainingStepsLeft?.fixedTrainingStepsLeft;
   const purchased = subscription?.trainingStepsLeft?.purchasedTrainingSteps;
@@ -47,7 +47,7 @@ export function downstreamSubscription(key) {
       stamina: { capacityPercent: staminaPercent(key.stamina_capacity ?? 0), availableImages: Math.floor(availableStamina(key) / IMAGE_STAMINA),
         capacityImages: (key.stamina_capacity ?? 0) / IMAGE_STAMINA, dailyImages: dailyFor(key.stamina_capacity ?? 0) / IMAGE_STAMINA } } };
 }
-export const isNai5Generation = (path, body) => ['/ai/generate-image', '/ai/generate-image-stream'].includes(path) && /^nai-diffusion-5-(full|curated)(-inpainting)?$/.test(body.model);
+export const isNai5Generation = (path, body) => ['/ai/generate-image', '/ai/generate-image-stream'].includes(path) && /^nai-diffusion-5-(full(-medium)?|curated)(-inpainting)?$/.test(body.model);
 function dimensions(p) {
   integer(p.width, 64, 4096, '宽度'); integer(p.height, 64, 4096, '高度');
   assert(p.width * p.height <= 3_145_728, '图片不能超过 3,145,728 像素');
@@ -82,6 +82,11 @@ export function reservation(path, body, subscription, details = false) {
   const area = dimensions(p), v5 = baseModel.startsWith('nai-diffusion-5'), v4 = baseModel.startsWith('nai-diffusion-4');
   assert(p.width <= 2048 && p.height <= 2048 && p.width % 64 === 0 && p.height % 64 === 0, '生成尺寸必须为 64 的倍数且不超过 2048');
   integer(p.n_samples, 1, 8, '图片张数'); integer(p.steps, 1, 50, '步数');
+  if (baseModel === 'nai-diffusion-5-full-medium') {
+    assert(p.steps === 14 && p.sampler === 'k_euler_ancestral', 'Medium 固定使用 14 步和 Euler Ancestral');
+    assert(p.cfg_rescale === undefined || p.cfg_rescale === 0, 'Medium 不支持 Guidance Rescale');
+    assert(p.ucPresetId === undefined || p.ucPresetId === 'heavy', 'Medium 固定使用 Heavy UC 预设');
+  }
   assert(!p.upscale, '请使用独立放大接口');
   assert(p.upscaled_enhance === undefined || typeof p.upscaled_enhance === 'boolean', 'Max 增强标记必须为布尔值');
   assert(!p.upscaled_enhance || v5 && body.action === 'img2img', 'Max 增强仅支持 V5 图生图');

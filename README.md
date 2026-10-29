@@ -210,3 +210,16 @@ tests/             本地模拟上游与集成测试
 ```
 
 计价预留公式的来源和许可见 `THIRD_PARTY_NOTICES.md`。
+
+
+## V5 Full Effort
+
+支持 High（通常）的原有模型，以及 Medium（节约）的 `nai-diffusion-5-full-medium` / `nai-diffusion-5-full-medium-inpainting`。普通 JSON、multipart 与流式生成共用模型校验、V5 路由和计费。
+
+Medium 请求固定 14 步、`k_euler_ancestral`；Guidance Rescale 必须为 0（或省略），UC 预设固定 Heavy。Sakura NAI Web 会保留用户 High 设置，仅在 Medium 的有效请求中使用 Heavy 并清空自定义全局和角色负面词。中转不替客户端改写请求；不符合上述固定采样参数会返回 400。
+
+计价按 2026-10-29 核实的 NovelAI 官方网页公式：仅步数项乘以 `1 / 1.06521739`，然后沿用基础向上取整、V5 的 1.5 系数及强度与免费资格。不能把公告的约 42% 节省直接作为所有请求的折扣。例如普通密钥单张 832×1216：High 23 步为 26 Anlas，Medium 14 步为 17 Anlas。
+
+下游本地体力仍按一次符合免费规格的请求扣 100 单位，与 High 相同；这套本地张数规则独立于 NovelAI 上游体力消耗。Medium 已纳入会员体力池、耗尽后的路由及失败释放流程。
+
+官方说明：https://docs.novelai.net/en/image/effort/

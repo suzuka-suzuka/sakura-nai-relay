@@ -89,3 +89,26 @@ test('小图放大的会员免费规格与有效上游 Opus 相同', () => {
   assert.equal(price(640,640,opus),0); assert.equal(price(512,512,standard),1);
   assert.equal(price(640,704,opus),1); assert.equal(price(640,640,{tier:3,active:false}),1);
 });
+
+
+test('Medium 模型和重绘按官方步数系数计价，限制固定参数', async () => {
+  const { isNai5Generation, quoteRequest } = await import('../src/billing.mjs');
+  for (const action of ['generate', 'img2img', 'infill']) {
+    const body = { model: 'nai-diffusion-5-full-medium' + (action === 'infill' ? '-inpainting' : ''), action,
+      parameters: { width:832, height:1216, steps:14, sampler:'k_euler_ancestral', n_samples:1,
+        cfg_rescale:0, ucPresetId:'heavy', image:'source', mask:'mask', strength:1 } };
+    for (const path of ['/ai/generate-image', '/ai/generate-image-stream']) {
+      assert.equal(isNai5Generation(path, body), true);
+      assert.equal(reservation(path, body, standard), 17);
+      assert.equal(reservation(path, body, opus), 0);
+      assert.deepEqual(quoteRequest(path, body, {tier:'member',stamina_balance:100}), {amount:0,stamina:100});
+      assert.deepEqual(quoteRequest(path, body, {tier:'member',stamina_balance:0}), {amount:17,stamina:0});
+    }
+    for (const patch of [{steps:23}, {sampler:'k_euler'}, {cfg_rescale:0.5}, {ucPresetId:'light'}])
+      assert.throws(() => reservation('/ai/generate-image', {...body,parameters:{...body.parameters,...patch}}, standard), /Medium/);
+    body.parameters.n_samples = 2;
+    assert.equal(reservation('/ai/generate-image', body, opus),17);
+    assert.equal(reservation('/ai/generate-image', body, standard),34);
+  }
+  assert.equal(isNai5Generation('/ai/generate-image', {model:'nai-diffusion-5-curated-medium'}),false);
+});

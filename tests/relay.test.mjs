@@ -1464,3 +1464,22 @@ test('错误重绘画布和强度在上游查询与扣点前被拒绝', async t 
   assert.equal(f.mock.state.calls.length,0); assertEntryFailures(f, 8);
   assert.equal(f.app.store.key(f.key.id).balance,100); assert.equal(f.app.store.key(f.key.id).reserved,0);
 });
+
+
+test('Medium JSON、multipart 重绘与流式请求保留模型并按新报价结算', async t => {
+  const f = await fixture(t);
+  const body = { ...payload(), model:'nai-diffusion-5-full-medium', parameters:{...payload().parameters,steps:14,sampler:'k_euler_ancestral',cfg_rescale:0,ucPresetId:'heavy'} };
+  const response = await f.relay('/ai/generate-image', body);
+  assert.equal(response.status,200); await response.text();
+  const stream = await f.relay('/ai/generate-image-stream', {...body, parameters:{...body.parameters,stream:'msgpack'}});
+  assert.equal(stream.status,200); await stream.arrayBuffer();
+  const infill = {...body, model:body.model+'-inpainting', action:'infill', parameters:{...body.parameters,image:'image',mask:'mask'}};
+  const bytes = canvasPng(832,1216);
+  const result = await sendForm(f, '/ai/generate-image', launcherForm(infill,{image:bytes,mask:bytes}));
+  assert.equal(result.status,200); await result.text();
+  assert.equal(f.app.store.key(f.key.id).balance,49);
+  const calls = f.mock.state.calls.filter(c => ["/ai/generate-image", "/ai/generate-image-stream"].includes(c.path));
+  assert.deepEqual(calls.map(c=>c.body.model),[body.model,body.model,infill.model]);
+  assert.equal(calls[1].body.parameters.stream,'sse');
+  assert.deepEqual(calls[2].parts.mask,bytes);
+});
