@@ -1498,3 +1498,46 @@ test('Medium JSON、multipart 重绘与流式请求保留模型并按新报价�
   assert.equal(calls[1].body.parameters.stream,'sse');
   assert.deepEqual(calls[2].parts.mask,bytes);
 });
+
+
+test('资源优先级：高优先级点数账户忙时等待，用至不足再切低优先级', async t => {
+  const f = await fixture(t);
+  f.mock.state.balance = 52;
+  f.app.store.updateUpstream(1, { enabled: true, priority: 100 });
+  await addAccount(f, 'pst-low-priority', { balance: 1000 });
+  const release = await f.app.router.lockUpstream(1);
+  const request = f.relay('/ai/generate-image', payload());
+  try {
+    await waitFor(() => f.app.router.upstreamQueue.size(1) === 2);
+    assert.equal(generatedCalls(f).length, 0);
+  } finally { release(); }
+  assert.equal((await request).status, 200);
+  for (let i=0; i<2; i++) assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.deepEqual(generatedCalls(f).map(c => c.auth), ['Bearer pst-local-test', 'Bearer pst-local-test', 'Bearer pst-low-priority']);
+});
+
+test('资源优先级：V5 体力连续使用高优先级，耗尽后切换低优先级', async t => {
+  for (const exhausted of [false, true]) await t.test(exhausted ? '本地体力耗尽' : '本地体力有效', async t => {
+  const f = await fixture(t); await member(f);
+  if (exhausted) f.app.store.db.prepare('UPDATE keys SET stamina_balance=0 WHERE id=?').run(f.key.id);
+  f.mock.state.paid = false;
+  f.app.store.updateUpstream(1, { enabled: true, priority: 100 });
+  await addAccount(f, 'pst-low-stamina', { paid: false });
+  let count = 0;
+  f.mock.state.onGenerate = () => { if (++count === 2) f.mock.state.paid = true; };
+  for (let i=0; i<3; i++) assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.deepEqual(generatedCalls(f).map(c => c.auth), ['Bearer pst-local-test', 'Bearer pst-local-test', 'Bearer pst-low-stamina']);
+  });
+});
+
+test('资源优先级：免费 V4.5 无视优先级，普通密钥实际免费上游也不受限制', async t => {
+  for (const isMember of [true, false]) await t.test(String(isMember), async t => {
+    const f = await fixture(t); if (isMember) await member(f);
+    f.mock.state.deltaOverride = 0;
+    f.mock.state.expiresAt = Math.floor(Date.now()/1000) + 86400;
+    const high = await addAccount(f, 'pst-high-free', { deltaOverride: 0 });
+    f.app.store.updateUpstream(high, { enabled: true, priority: 100 });
+    assert.equal((await f.relay('/ai/generate-image', v45Payload())).status, 200);
+    assert.equal(generatedCalls(f)[0].auth, 'Bearer pst-local-test');
+  });
+});

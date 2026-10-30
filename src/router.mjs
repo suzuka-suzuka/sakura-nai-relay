@@ -1,7 +1,7 @@
 import { assert } from './security.mjs';
 import { SerialQueue } from './queue.mjs';
 
-/** Shortest queues first, then highest priority in every pool; ties use the existing pool ordering. */
+/** Resource pools drain the highest priority first; free requests only balance queue load. */
 export class UpstreamRouter {
   constructor(store) {
     this.store = store;
@@ -26,10 +26,11 @@ export class UpstreamRouter {
   pick(excluded = new Set(), pool = null) {
     const rows = this.available().filter(r => !excluded.has(r.id) && (!pool || pool.ids.has(r.id)));
     if (!rows.length) return null;
-    const length = Math.min(...rows.map(r => this.upstreamQueue.size(r.id)));
-    const shortest = rows.filter(r => this.upstreamQueue.size(r.id) === length);
-    const priority = Math.max(...shortest.map(r => r.priority ?? 0));
-    const candidates = shortest.filter(r => (r.priority ?? 0) === priority);
+    const consumesResources = row => pool?.usePriority && (!pool.resourceIds || pool.resourceIds.has(row.id));
+    const priority = Math.max(...rows.filter(consumesResources).map(r => r.priority ?? 0));
+    const eligible = rows.filter(r => !consumesResources(r) || (r.priority ?? 0) === priority);
+    const length = Math.min(...eligible.map(r => this.upstreamQueue.size(r.id)));
+    const candidates = eligible.filter(r => this.upstreamQueue.size(r.id) === length);
     if (pool?.order === 'expiry') {
       const expiry = id => {
         const value = pool.expires?.get(id);

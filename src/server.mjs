@@ -295,6 +295,11 @@ export function createApp(config) {
     assert(current.balance - current.reserved >= amount, `Anlas 不足，本次需要 ${amount} Anlas`, 402);
     let lastError = null, pools = [null];
     const noteAccount = (pool, id, subscription) => {
+      if (pool?.resourceIds) {
+        const estimate = reservation(path, body, subscription, true);
+        const consumes = typeof estimate === 'number' ? estimate > 0 : estimate.total > 0 || estimate.usesAllowance;
+        if (consumes) pool.resourceIds.add(id); else pool.resourceIds.delete(id);
+      }
       if (!pool?.expires && !pool?.nonOpus) return;
       if (pool.expires) {
         if (Number.isFinite(subscription?.expiresAt)) pool.expires.set(id, subscription.expiresAt);
@@ -320,9 +325,9 @@ export function createApp(config) {
     if (key.tier === 'member') {
       let rows;
       try { rows = router.available(); } catch (error) { if (strictStamina) throw staminaUnavailable(error); throw error; }
-      const staminaPool = { scope: 'stamina', ids: new Set(), mode: 'nai5-local-stamina' };
-      const freePool = { scope: 'free', ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
-      const anlasPool = { scope: 'anlas', ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
+      const staminaPool = { scope: 'stamina', usePriority: true, ids: new Set(), mode: 'nai5-local-stamina' };
+      const freePool = { scope: 'free', usePriority: isNai5Generation(path, body), ids: new Set(), mode: exhaustedNai5 ? 'nai5-stamina-pool' : 'opus-pool' };
+      const anlasPool = { scope: 'anlas', usePriority: true, resourceIds: new Set(), ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
       const preferFree = amount === 0 || exhaustedNai5;
       pools = strictStamina ? [staminaPool] : preferFree ? [freePool, anlasPool] : [anlasPool];
       await scan(rows, (row, subscription) => {
@@ -335,7 +340,7 @@ export function createApp(config) {
       let rows;
       try { rows = router.available(); } catch (error) { throw error; }
       if (rows.length > 1) {
-        const pointsPool = { scope: 'pool', ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
+        const pointsPool = { scope: 'pool', usePriority: true, resourceIds: new Set(), ids: new Set(), mode, order: 'expiry', expires: new Map(), nonOpus: new Set() };
         pools = [pointsPool];
         await scan(rows, (row, subscription) => {
           const estimate = reservation(path, body, subscription), balance = balanceOf(subscription);
