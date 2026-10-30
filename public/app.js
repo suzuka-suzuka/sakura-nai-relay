@@ -513,7 +513,7 @@ document.addEventListener('click', async event => {
     const key = button.dataset.sort;
     const direction = key === 'id' ? 'asc' : state.upstreamSort.key === key
       ? state.upstreamSort.direction === 'asc' ? 'desc' : 'asc'
-      : ['points', 'stamina'].includes(key) ? 'desc' : 'asc';
+      : ['priority', 'points', 'stamina'].includes(key) ? 'desc' : 'asc';
     state.upstreamSort = { key, direction };
     $('#upstream-list').innerHTML = upstreamTable();
     $(`[data-sort="${key}"]`)?.focus({ preventScroll: true });
