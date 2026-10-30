@@ -154,6 +154,10 @@ export function createApp(config) {
         const body = parse(await readBody(req, 16384));
         const name = optionalName(body.name === undefined ? previous?.name ?? '' : body.name);
         const metadata = {};
+        if (body.priority !== undefined) {
+          assert(Number.isInteger(body.priority) && body.priority >= 0 && body.priority <= 999999, '优先级须为 0 到 999999 的整数');
+          metadata.priority = body.priority;
+        }
         for (const [field, label, limit] of [['note', '备注', 1000]]) {
           if (body[field] === undefined) continue;
           assert(typeof body[field] === 'string' && body[field].length <= limit, `${label}须为不超过 ${limit} 个字符的文本`);

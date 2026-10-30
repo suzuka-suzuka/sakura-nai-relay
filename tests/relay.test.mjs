@@ -769,6 +769,21 @@ export async function addAccount(f, token, { enabled = true, ...account } = {}) 
 }
 const generatedCalls = f => f.mock.state.calls.filter(c => c.path === '/ai/generate-image');
 
+test('上游优先级 API 校验、保留设置并实际覆盖点数池套餐偏好', async t => {
+  const f = await fixture(t);
+  f.mock.state.tier = 3;
+  await addAccount(f, 'pst-low-priority', { tier: 1, balance: 10000 });
+  const id = f.app.store.upstreams()[0].id;
+  for (const priority of [-1, 1.5, 1000000, '10', null]) {
+    assert.equal((await f.call('/admin/api/upstreams/' + id, 'PUT', { enabled: true, priority })).status, 400);
+  }
+  assert.equal((await f.call('/admin/api/upstreams/' + id, 'PUT', { enabled: true, priority: 100 })).status, 200);
+  assert.equal((await f.call('/admin/api/upstreams/' + id, 'PUT', { enabled: true, name: '保留优先级' })).status, 200);
+  assert.equal(f.app.store.upstreams()[0].priority, 100);
+  assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
+  assert.equal(generatedCalls(f).at(-1).auth, 'Bearer pst-local-test');
+});
+
 test('普通点数请求优先非 Opus 账号，占用中再按 Opus 到期时间换下一个', async t => {
   const f = await fixture(t), now = Math.floor(Date.now() / 1000);
   f.mock.state.tier = 3;

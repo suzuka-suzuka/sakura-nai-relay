@@ -1,7 +1,7 @@
 import { assert } from './security.mjs';
 import { SerialQueue } from './queue.mjs';
 
-/** Prefer idle accounts, then shortest queues. Point pools use any non-Opus account first, then the soonest Opus expiry; other pools round-robin ties by id. */
+/** Shortest queues first, then highest priority in every pool; ties use the existing pool ordering. */
 export class UpstreamRouter {
   constructor(store) {
     this.store = store;
@@ -27,7 +27,9 @@ export class UpstreamRouter {
     const rows = this.available().filter(r => !excluded.has(r.id) && (!pool || pool.ids.has(r.id)));
     if (!rows.length) return null;
     const length = Math.min(...rows.map(r => this.upstreamQueue.size(r.id)));
-    const candidates = rows.filter(r => this.upstreamQueue.size(r.id) === length);
+    const shortest = rows.filter(r => this.upstreamQueue.size(r.id) === length);
+    const priority = Math.max(...shortest.map(r => r.priority ?? 0));
+    const candidates = shortest.filter(r => (r.priority ?? 0) === priority);
     if (pool?.order === 'expiry') {
       const expiry = id => {
         const value = pool.expires?.get(id);

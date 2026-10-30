@@ -10,6 +10,47 @@ function fixture(t) {
   return {rows,router,occupy:async id=>{const release=await router.lockUpstream(id);releases.push(release);return release;}};
 }
 
+test('所有池空闲账户按优先级选择，并跳过不合格账户', async t => {
+  const { rows, router, occupy } = fixture(t);
+  rows[0].priority = 10; rows[1].priority = 20;
+  for (const scope of [null, 'pool', 'anlas', 'free', 'stamina']) {
+    const pool = scope === null ? null : { scope, ids: new Set([1,2,3]),
+      ...(['pool', 'anlas'].includes(scope) ? { order: 'expiry', nonOpus: new Set([1]), expires: new Map([[2,900],[3,100]]) } : {}) };
+    assert.equal(router.pick(new Set(), pool).id, 2);
+    assert.equal(router.pick(new Set([2]), pool).id, 1);
+    router.failed(2, '冷却');
+    assert.equal(router.pick(new Set(), pool).id, 1);
+    router.reset(2); rows[1].enabled = false;
+    assert.equal(router.pick(new Set(), pool).id, 1);
+    rows[1].enabled = true;
+    if (pool) { pool.ids.delete(2); assert.equal(router.pick(new Set(), pool).id, 1); }
+  }
+  await occupy(2);
+  assert.equal(router.pick().id, 1);
+});
+
+test('所有池高优先级忙时用较低优先级空闲账户，全忙才按最短队列和优先级排队', async t => {
+  const { rows, router, occupy } = fixture(t);
+  rows.splice(3);
+  rows[0].priority = 100; rows[1].priority = 50; rows[2].priority = 0;
+  const pools = [null, ...['pool', 'anlas', 'free', 'stamina'].map(scope => ({ scope, ids: new Set([1,2,3]) }))];
+  const expect = id => { for (const pool of pools) assert.equal(router.pick(new Set(), pool).id, id); };
+  expect(1);
+  const releaseHigh = await occupy(1);
+  expect(2);
+  await occupy(2);
+  expect(3);
+  await occupy(3);
+  expect(1);
+  const controller = new AbortController();
+  const waiting = router.lockUpstream(1, controller.signal).catch(error => error);
+  assert.deepEqual(rows.map(row => router.upstreamQueue.size(row.id)), [2,1,1]);
+  expect(2);
+  controller.abort(); await waiting;
+  releaseHigh();
+  expect(1);
+});
+
 test('账号池优先空闲，即使轮询下一位正在执行也不等待它',async t=>{
   const {rows,router,occupy}=fixture(t);rows.splice(2);
   router.commit(1);

@@ -6,6 +6,26 @@ import { join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
 import { Store } from '../src/db.mjs';
 
+test('优先级旧库迁移默认为零，修改、启停、重启和恢复账户正确持久化', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'relay-upstream-priority-'));
+  let store = new Store(directory);
+  try {
+    const id = store.addUpstream({ name: '旧上游', token: 'pst-priority' });
+    store.db.exec('ALTER TABLE upstreams DROP COLUMN priority');
+    store.close(); store = new Store(directory);
+    assert.equal(store.upstreams()[0].priority, 0);
+    store.updateUpstream(id, { enabled: true, priority: 100 });
+    store.updateUpstream(id, { enabled: false });
+    store.close(); store = new Store(directory);
+    assert.equal(store.upstreams()[0].priority, 100);
+    assert.throws(() => store.updateUpstream(id, { enabled: true, priority: -1 }));
+    assert.equal(store.upstream(id).priority, 100);
+    store.retireUpstream(id);
+    assert.equal(store.addUpstream({ token: 'pst-priority', priority: 50 }), id);
+    assert.equal(store.upstream(id).priority, 50);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('旧上游迁移为空白元数据，保存、启停与重启保留备注，允许清空', () => {
   const directory = mkdtempSync(join(tmpdir(), 'relay-upstream-metadata-'));
   let store = new Store(directory);
@@ -37,6 +57,10 @@ test('上游数值双向排序，未知值始终置底，同值稳定，显示�
     }
   }
   const html = context.upstreamTable();
+  assert.equal((html.match(/data-sort="priority"/g) ?? []).length, 1);
+  assert.match(html, /colspan="9"/);
+  runInContext('state.data.upstreams.forEach(row => row.priority = row.id === 2 ? 100 : 0); state.upstreamSort = { key: "priority", direction: "desc" };', context);
+  assert.deepEqual(Array.from(context.sortedUpstreams(), row => row.id), [2,1,3,4]);
   assert.match(html, /aria-sort="descending"/);
   assert.match(html, /&lt;img/);
   assert.doesNotMatch(html, /<img|<script/);
