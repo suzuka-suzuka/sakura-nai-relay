@@ -10,22 +10,25 @@ function fixture(t) {
   return {rows,router,occupy:async id=>{const release=await router.lockUpstream(id);releases.push(release);return release;}};
 }
 
-test('资源池严格先用最高优先级，忙时等待，耗尽或不可用才回退', async t => {
+test('资源池先选最低负载，同负载优先级高者优先，排除不可用账户', async t => {
   const { rows, router, occupy } = fixture(t);
   rows[0].priority = 100; rows[1].priority = 50; rows[2].priority = 50;
   const pool = { scope: 'stamina', usePriority: true, ids: new Set([1,2,3]) };
   assert.equal(router.pick(new Set(), pool).id, 1);
   await occupy(1);
+  assert.equal(router.pick(new Set(), pool).id, 2);
+  await occupy(2); await occupy(3);
   assert.equal(router.pick(new Set(), pool).id, 1);
   const controller = new AbortController();
   const pending = router.lockUpstream(1, controller.signal).catch(error => error);
-  assert.equal(router.pick(new Set(), pool).id, 1);
+  assert.equal(router.pick(new Set(), pool).id, 2);
+  router.commit(2, pool); assert.equal(router.pick(new Set(), pool).id, 3);
+  router.commit(3, pool);
   controller.abort(); await pending;
   assert.equal(router.pick(new Set([1]), pool).id, 2);
   router.failed(1, '冷却'); assert.equal(router.pick(new Set(), pool).id, 2); router.reset(1);
   rows[0].enabled = false; assert.equal(router.pick(new Set(), pool).id, 2); rows[0].enabled = true;
   pool.ids.delete(1); assert.equal(router.pick(new Set(), pool).id, 2);
-  await occupy(2); assert.equal(router.pick(new Set(), pool).id, 3);
 });
 
 test('不消耗资源的请求忽略优先级，按最短队列和轮询分配', async t => {
@@ -37,13 +40,14 @@ test('不消耗资源的请求忽略优先级，按最短队列和轮询分配',
   await occupy(2); assert.equal(router.pick(new Set(), pool).id, 1);
 });
 
-test('混合池按实际上游资源消耗筛选，零消耗账户不受优先级限制', async t => {
+test('混合池负载优先，同负载下零消耗账户不受资源优先级限制', async t => {
   const { rows, router, occupy } = fixture(t);
   rows[0].priority = 100; rows[1].priority = 50; rows[2].priority = 0;
   const pool = { scope: 'pool', usePriority: true, resourceIds: new Set([1,2]), ids: new Set([1,2,3]) };
   await occupy(1);
-  assert.equal(router.pick(new Set(), pool).id, 3);
-  pool.ids.delete(3); assert.equal(router.pick(new Set(), pool).id, 1);
+  assert.equal(router.pick(new Set(), pool).id, 2);
+  router.commit(2, pool); assert.equal(router.pick(new Set(), pool).id, 3);
+  pool.ids.delete(3); assert.equal(router.pick(new Set(), pool).id, 2);
 });
 
 test('账号池优先空闲，即使轮询下一位正在执行也不等待它',async t=>{

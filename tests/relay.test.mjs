@@ -1500,20 +1500,39 @@ test('Medium JSON、multipart 重绘与流式请求保留模型并按新报价�
 });
 
 
-test('资源优先级：高优先级点数账户忙时等待，用至不足再切低优先级', async t => {
+test('资源优先级：高优先级点数账户忙时分流，空闲后优先使用，余额不足再回退', async t => {
   const f = await fixture(t);
-  f.mock.state.balance = 52;
+  f.mock.state.balance = 26;
   f.app.store.updateUpstream(1, { enabled: true, priority: 100 });
   await addAccount(f, 'pst-low-priority', { balance: 1000 });
   const release = await f.app.router.lockUpstream(1);
   const request = f.relay('/ai/generate-image', payload());
   try {
-    await waitFor(() => f.app.router.upstreamQueue.size(1) === 2);
-    assert.equal(generatedCalls(f).length, 0);
+    await waitFor(() => generatedCalls(f).length === 1);
+    assert.equal((await request).status, 200);
+    assert.equal(f.app.router.upstreamQueue.size(1), 1);
+    assert.equal(generatedCalls(f)[0].auth, 'Bearer pst-low-priority');
   } finally { release(); }
-  assert.equal((await request).status, 200);
   for (let i=0; i<2; i++) assert.equal((await f.relay('/ai/generate-image', payload())).status, 200);
-  assert.deepEqual(generatedCalls(f).map(c => c.auth), ['Bearer pst-local-test', 'Bearer pst-local-test', 'Bearer pst-low-priority']);
+  assert.deepEqual(generatedCalls(f).map(c => c.auth), ['Bearer pst-low-priority', 'Bearer pst-local-test', 'Bearer pst-low-priority']);
+});
+
+test('资源优先级：V5 体力请求在高优先级忙时使用低优先级空闲账户', async t => {
+  for (const exhausted of [false, true]) await t.test(exhausted ? '本地体力耗尽' : '本地体力有效', async t => {
+    const f = await fixture(t); await member(f);
+    if (exhausted) f.app.store.db.prepare('UPDATE keys SET stamina_balance=0 WHERE id=?').run(f.key.id);
+    f.mock.state.paid = false;
+    f.app.store.updateUpstream(1, { enabled: true, priority: 100 });
+    await addAccount(f, 'pst-low-stamina', { paid: false });
+    const release = await f.app.router.lockUpstream(1);
+    const request = f.relay('/ai/generate-image', payload());
+    try {
+      await waitFor(() => generatedCalls(f).length === 1);
+      assert.equal((await request).status, 200);
+      assert.equal(generatedCalls(f)[0].auth, 'Bearer pst-low-stamina');
+      assert.equal(f.app.router.upstreamQueue.size(1), 1);
+    } finally { release(); }
+  });
 });
 
 test('资源优先级：V5 体力连续使用高优先级，耗尽后切换低优先级', async t => {

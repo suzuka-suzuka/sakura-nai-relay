@@ -1,7 +1,7 @@
 import { assert } from './security.mjs';
 import { SerialQueue } from './queue.mjs';
 
-/** Resource pools drain the highest priority first; free requests only balance queue load. */
+/** Balance queue load first; resource priority breaks ties, while free candidates ignore it. */
 export class UpstreamRouter {
   constructor(store) {
     this.store = store;
@@ -27,10 +27,11 @@ export class UpstreamRouter {
     const rows = this.available().filter(r => !excluded.has(r.id) && (!pool || pool.ids.has(r.id)));
     if (!rows.length) return null;
     const consumesResources = row => pool?.usePriority && (!pool.resourceIds || pool.resourceIds.has(row.id));
-    const priority = Math.max(...rows.filter(consumesResources).map(r => r.priority ?? 0));
-    const eligible = rows.filter(r => !consumesResources(r) || (r.priority ?? 0) === priority);
-    const length = Math.min(...eligible.map(r => this.upstreamQueue.size(r.id)));
-    const candidates = eligible.filter(r => this.upstreamQueue.size(r.id) === length);
+    // Queue size includes active work, so idle accounts always win over busy ones.
+    const length = Math.min(...rows.map(r => this.upstreamQueue.size(r.id)));
+    const eligible = rows.filter(r => this.upstreamQueue.size(r.id) === length);
+    const priority = Math.max(...eligible.filter(consumesResources).map(r => r.priority ?? 0));
+    const candidates = eligible.filter(r => !consumesResources(r) || (r.priority ?? 0) === priority);
     if (pool?.order === 'expiry') {
       const expiry = id => {
         const value = pool.expires?.get(id);
